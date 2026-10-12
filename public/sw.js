@@ -1,5 +1,5 @@
 // Service worker: offline app shell, push notifications (check-ins), and the app badge.
-const CACHE = 'mochi-shell-v1';
+const CACHE = 'mochi-shell-v2';
 const SHELL = [
   '/',
   '/styles.css',
@@ -49,6 +49,8 @@ self.addEventListener('fetch', (event) => {
   );
 });
 
+// Payloads use the Declarative Web Push shape ({ web_push: 8030, notification: {...} }). iOS 18.4+ shows those
+// by itself; everywhere else this handler does. Older payloads were flat { title, body, tag, url }.
 self.addEventListener('push', (event) => {
   let data = {};
   try {
@@ -56,18 +58,18 @@ self.addEventListener('push', (event) => {
   } catch {
     data = { body: event.data ? event.data.text() : '' };
   }
-  const title = data.title || 'Dr. Mochi';
+  const n = data.notification || data;
   event.waitUntil(
     (async () => {
-      await self.registration.showNotification(title, {
-        body: data.body || 'New message',
+      await self.registration.showNotification(n.title || 'Dr. Mochi', {
+        body: n.body || 'New message',
         icon: '/icons/icon-192.png',
         badge: '/icons/icon-192.png',
-        tag: data.tag || 'mochi',
+        tag: n.tag || 'mochi',
         renotify: true,
-        data: { url: data.url || '/' },
+        data: { url: n.navigate || n.url || '/' },
       });
-      if (self.navigator.setAppBadge) await self.navigator.setAppBadge(1).catch(() => {});
+      if (self.navigator.setAppBadge) await self.navigator.setAppBadge(n.app_badge || 1).catch(() => {});
       const windows = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
       for (const client of windows) client.postMessage({ type: 'push' });
     })(),

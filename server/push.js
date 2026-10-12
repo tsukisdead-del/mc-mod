@@ -4,6 +4,7 @@ import webpush from 'web-push';
 import { config } from './config.js';
 import { state, save } from './store.js';
 import { plainText } from '../public/js/reply-format.js';
+import { pushPayload, vapidSubject, PUSH_TTL } from './push-payload.js';
 
 // VAPID keys identify this server to Apple/Google push services. Use env vars if given,
 // otherwise generate a pair once and keep it in the data folder.
@@ -22,10 +23,6 @@ function loadVapidKeys() {
 }
 
 const vapid = loadVapidKeys();
-// Push services want a contact URL or email for the sender.
-const subject =
-  config.vapidSubject || (config.publicUrl.startsWith('https://') ? config.publicUrl : 'mailto:checkins@example.com');
-webpush.setVapidDetails(subject, vapid.publicKey, vapid.privateKey);
 
 export const vapidPublicKey = vapid.publicKey;
 
@@ -49,14 +46,25 @@ export function removeSubscription(endpoint) {
   save();
 }
 
+// The app's https address: PUBLIC_URL, or what the browser last used to reach us (see /api/state).
+function appOrigin() {
+  return config.publicUrl || state.origin || '';
+}
+
 // Send a notification to every registered device. Returns how many got it.
-export async function notifyAll({ title, body, tag = 'mochi', url = '/' }) {
-  const payload = JSON.stringify({ title, body: body.slice(0, 240), tag, url });
+export async function notifyAll({ title, body, tag = 'mochi' }) {
+  const origin = appOrigin();
+  const payload = JSON.stringify(pushPayload({ title, body, tag, origin }));
+  const options = {
+    TTL: PUSH_TTL,
+    urgency: 'normal',
+    vapidDetails: { subject: vapidSubject(config.vapidSubject, origin), publicKey: vapid.publicKey, privateKey: vapid.privateKey },
+  };
   let delivered = 0;
   await Promise.all(
     state.pushSubscriptions.map(async (sub) => {
       try {
-        await webpush.sendNotification(sub, payload, { TTL: 6 * 60 * 60, urgency: 'normal' });
+        await webpush.sendNotification(sub, payload, options);
         delivered++;
       } catch (err) {
         if (err.statusCode === 404 || err.statusCode === 410) removeSubscription(sub.endpoint);

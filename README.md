@@ -2,7 +2,7 @@
 
 A private texting app where you talk to **Dr. Mochi**, a cartoon AI therapist. You type or talk out loud, and it texts back. You can send it photos and documents to look at, it texts *you* first to check in, and a slider controls how gentle or how real it is with you. It installs on your iPhone like a normal app.
 
-**It can run completely free** on Cloudflare's free plan, using Google's open Gemma 4 model, or with Claude for the best conversations (you pay per message). Same app, same features. See [Two ways to run it](#two-ways-to-run-it).
+**It can run completely free**, either on Cloudflare's free plan or on your own computer with Ollama, using Google's open Gemma 4 model. Or use Claude for the best conversations (you pay per message). Same app, same features. See [Three ways to run it](#three-ways-to-run-it).
 
 ![Dr. Mochi screens](docs/preview.png)
 
@@ -26,17 +26,17 @@ A private texting app where you talk to **Dr. Mochi**, a cartoon AI therapist. Y
 
 ---
 
-## Two ways to run it
+## Three ways to run it
 
-| | **Free version** (Cloudflare) | **Claude version** |
-| --- | --- | --- |
-| Cost | **$0**. No credit card. | Pay per message to Anthropic (about a cent or a few cents each), plus hosting if you use Render/Railway |
-| AI | Gemma 4 (Google's open model) on Cloudflare Workers AI | Claude, the most natural and thoughtful conversations |
-| Daily limit | Roughly 250 texts a day; resets at midnight UTC | None |
-| Everything else | Same app: cartoon, voice, photos, documents, tone slider, check-in notifications, memory, iPhone profile | Same |
-| Setup | About 10 minutes, all in a browser (works from a phone) | About 15 minutes |
+| | **Free: Cloudflare** | **Free: your own computer** | **Claude** |
+| --- | --- | --- | --- |
+| Cost | **$0**, no credit card | **$0** | Pay per message to Anthropic (about a cent or a few cents each), plus hosting if you use Render/Railway |
+| AI | Gemma 4 (Google's open model) on Cloudflare Workers AI | Gemma 4 (or any Ollama model) running on your computer | Claude, the most natural and thoughtful conversations |
+| Limits | Roughly 250 texts a day; resets at midnight UTC | None, but your computer has to be on and awake | None |
+| Privacy | Chats stored in your Cloudflare account; Cloudflare says it doesn't train on them | Nothing leaves your computer except through the tunnel you choose | Chats on your server; messages sent to Anthropic |
+| Setup | About 10 minutes in a browser (works from a phone) | About 20 minutes; needs a reasonably recent computer (8 GB+ memory) | About 15 minutes |
 
-You can start free and switch to Claude later by adding one setting, without moving your chats.
+All three have the same app: the cartoon, voice, photos, documents, tone slider, check-in notifications, memory, and the iPhone profile. You can start free and switch to Claude later by adding one setting, without losing your chats.
 
 ---
 
@@ -79,6 +79,34 @@ Same as the Claude version: see [Put it on your iPhone](#4-put-it-on-your-iphone
 - **Switch to Claude anytime.** Add a Secret named `ANTHROPIC_API_KEY` (see step 1 below) in **Settings → Variables and Secrets**. Hosting stays free; you only pay Anthropic per message.
 
 **If the first build fails** with a permissions error about D1: go to **My Profile → API Tokens → Create Token**, give it *Workers Scripts: Edit*, *D1: Edit* and *Account Settings: Read*, then pick that token under the Worker's **Settings → Build → API token** and retry the build. If it says you need a `workers.dev` subdomain, open **Workers & Pages**, choose one, and retry.
+
+---
+
+## Free version on your own computer (Ollama)
+
+Everything runs on your Mac or PC, including the AI, so it's free and private. The catch: your computer has to be on and awake for Dr. Mochi to reply or check in.
+
+1. **Install Ollama** from [ollama.com](https://ollama.com) and open it. Then, in Terminal (Mac) or PowerShell (Windows), download the model (a few GB):
+   ```bash
+   ollama pull gemma4
+   ```
+   On an older or 8 GB computer, use the smaller one instead: `ollama pull gemma4:e2b`, and add `OLLAMA_MODEL=gemma4:e2b` to your `.env` in step 3.
+2. **Install Node.js** (version 20 or newer) from [nodejs.org](https://nodejs.org). Download this project (on GitHub: **Code → Download ZIP**) and unzip it.
+3. **Start Dr. Mochi.** In Terminal, go into the project folder, then:
+   ```bash
+   npm install
+   cp .env.example .env     # then open .env and set ACCESS_CODE to your own private code
+   npm start
+   ```
+   With no Claude key in `.env`, it uses Ollama automatically. The startup message says whether Ollama and the model are ready. Open [http://localhost:3000](http://localhost:3000) on the computer.
+4. **On your iPhone.** On the same Wi-Fi, Safari can open `http://<your computer's local IP>:3000` for plain chatting. For the full iPhone app (Home Screen icon, notifications, microphone), iPhone requires an **https** address, which a free tunnel provides:
+   - [Tailscale Funnel](https://tailscale.com/kb/1223/funnel) gives a permanent address like `https://your-computer.your-tailnet.ts.net`: install Tailscale, then run `tailscale funnel 3000`.
+   - Or, for a quick try: `npx cloudflared tunnel --url http://localhost:3000` prints a `https://….trycloudflare.com` address. It changes every time you start it, so you'd have to reinstall the iPhone app each time.
+
+   Put that address in `.env` as `PUBLIC_URL=https://…`, restart with `npm start`, then follow [Put it on your iPhone](#4-put-it-on-your-iphone) using that address.
+5. **Keep the computer awake** while you want check-ins: on a Mac, run `caffeinate -s` in another Terminal window; on Windows, set sleep to "Never" while plugged in.
+
+Photos and documents work the same way. PDFs are turned into text on your computer; scanned PDFs (pictures of pages) have no text, so send those as photos. Talking out loud uses your phone's own speech recognition (or the keyboard's dictation mic).
 
 ---
 
@@ -139,7 +167,7 @@ On your iPhone, open **`https://YOUR-ADDRESS/install` in Safari**. On a computer
 
 **Or: Add to Home Screen**
 
-In Safari, tap **Share → Add to Home Screen**. This method is the most reliable for notifications.
+In Safari, tap **Share → Add to Home Screen**. This is the way Apple officially supports for web-app notifications, so if the profile version never offers to turn notifications on, add it this way too and use that one. (Whether profile-installed apps get notifications isn't documented by Apple; it needs testing on your phone.)
 
 The profile is generated by the server at `/app.mobileconfig`, already pointed at your address. If you want the file itself, for example to AirDrop it, run `npm run profile -- https://YOUR-ADDRESS`.
 
@@ -167,8 +195,11 @@ In the app, tap the **sliders icon** (top right) → **Check-ins** → **Notific
 
 ## Privacy
 
-- Your chats, memory notes and uploaded files are stored only on **your** server, in `DATA_DIR`.
-- Messages, and the photos and files you send, go to Anthropic's API to generate replies. See Anthropic's [privacy policy](https://www.anthropic.com/legal/privacy).
+- Your chats, memory notes and uploaded files are stored only on **your** server: `DATA_DIR` for the Node version, your own D1 database for the Cloudflare version.
+- Where messages go to generate replies:
+  - **Claude:** your messages, photos and files go to Anthropic's API. See Anthropic's [privacy policy](https://www.anthropic.com/legal/privacy).
+  - **Free Cloudflare version:** they go to Workers AI in your Cloudflare account. Cloudflare says it doesn't use them to train models.
+  - **Free local version:** the AI runs on your computer, so they stay there (plus the tunnel you choose for iPhone access).
 - The app is locked behind your access code with an HttpOnly cookie. Changing `ACCESS_CODE` logs every device out.
 - **Delete chat history** removes all messages and uploaded files from the server. **Erase** (under Memory) wipes the notes.
 
@@ -176,7 +207,7 @@ In the app, tap the **sliders icon** (top right) → **Check-ins** → **Notific
 
 | Variable | Required | Default | Notes |
 | --- | --- | --- | --- |
-| `ANTHROPIC_API_KEY` | yes | | Your Claude API key. |
+| `ANTHROPIC_API_KEY` | for Claude | | Your Claude API key. Without it, the Node server uses Ollama on the same computer (free). |
 | `ACCESS_CODE` | yes | | The code you type to unlock the app. |
 | `DATA_DIR` | | `./data` | Where chats, memory, uploads and push keys live. Use a persistent disk. |
 | `PUBLIC_URL` | | auto | Your https address. Detected automatically on Render and Railway. Used in the iPhone profile and QR code. |
@@ -185,6 +216,10 @@ In the app, tap the **sliders icon** (top right) → **Check-ins** → **Notific
 | `VAPID_PUBLIC_KEY` / `VAPID_PRIVATE_KEY` | | generated | Push notification keys, generated once and saved in `DATA_DIR`. |
 | `VAPID_SUBJECT` | | your URL | Contact address push services can use (`mailto:` or https). |
 | `MOCK_AI` | | | Set to `1` for canned replies with no API key (demo/testing). |
+| `OLLAMA_MODEL` | | `gemma4` | Free local mode (used when there's no Claude key): which Ollama model to use. |
+| `OLLAMA_URL` | | `http://127.0.0.1:11434` | Where Ollama is running. |
+| `OLLAMA_NUM_CTX` | | `16384` | The model's context window in tokens. Lower it on computers with little memory. |
+| `OLLAMA_VISION` | | on | Set to `0` if your model can't see images. |
 
 Cloudflare (free) version: the same names work as **Secrets** or **Variables** on the Worker (`ACCESS_CODE`, `ANTHROPIC_API_KEY`, `CLAUDE_MODEL`, `CHAT_EFFORT`, `PUBLIC_URL`, `VAPID_*`, `MOCK_AI`), plus:
 
@@ -201,7 +236,7 @@ Requires Node.js 20.12 or newer.
 ```bash
 npm install
 npm run demo          # canned replies, access code "demo" → http://localhost:3000
-cp .env.example .env  # then fill in ANTHROPIC_API_KEY and ACCESS_CODE
+cp .env.example .env  # then set ACCESS_CODE (and ANTHROPIC_API_KEY to use Claude instead of Ollama)
 npm start             # the real thing
 npm test              # unit tests
 npm run cf:demo       # the Cloudflare version locally (canned replies; no account needed) → http://localhost:8787
@@ -212,7 +247,7 @@ To try it on your phone before deploying, expose your computer over https, e.g. 
 ## How it works
 
 - `worker/`: the free Cloudflare version. The same `/api` as the Node server, so the same frontend works on both. `store.js` uses D1; `ai.js` runs Workers AI (or Claude if a key is set); `webpush.js` sends notifications with WebCrypto; the `scheduled` handler runs check-ins.
-- `server/`: Express app. `ai.js` talks to Claude with streaming, prompt caching and a server-side safety fallback; `prompts.js` holds the persona, tone bands and check-in instructions; `scheduler.js` decides when to check in; `push.js` sends Web Push notifications; `profile.js` builds the iPhone `.mobileconfig`; `store.js` keeps everything in one JSON file.
+- `server/`: the Node/Express version. `ai.js` talks to Claude with streaming, prompt caching and a server-side safety fallback; `scheduler.js` runs check-ins; `push.js` sends Web Push notifications; `store.js` keeps everything in one JSON file. Shared by both versions: `prompts.js` (persona, tone bands, check-in instructions), `history.js` (turning chats into model input), `checkins.js` (when to check in), `safety.js` (crisis-word backstop), `file-types.js`, `settings.js`, `time.js` and `profile.js` (the iPhone `.mobileconfig`).
 - `public/`: the installable web app (no build step). `js/avatar.js` is the cartoon (one SVG, with expressions driven by CSS), `js/voice.js` handles speech recognition and read-aloud, and `sw.js` is the service worker for notifications and offline loading.
 - Each reply starts with a hidden `[[mood:…]]` tag that sets the cartoon's face, and uses `|||` to split into separate texts. A `[[crisis]]` tag shows the help card.
 - `npm run icons` regenerates the app icons from the cartoon (needs Playwright + Chromium).

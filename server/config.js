@@ -28,6 +28,14 @@ export const config = {
   chatEffort: (process.env.CHAT_EFFORT || 'medium').trim(),
   mockAI: process.env.MOCK_AI === '1',
   hasApiKey: Boolean(process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN),
+  // Who does the thinking: Claude when an API key is set, otherwise Ollama on this computer (free).
+  aiProvider:
+    process.env.MOCK_AI === '1' ? 'mock' : process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN ? 'anthropic' : 'ollama',
+  ollamaUrl: (process.env.OLLAMA_URL || 'http://127.0.0.1:11434').trim().replace(/\/+$/, ''),
+  ollamaModel: (process.env.OLLAMA_MODEL || 'gemma4').trim(),
+  // Ollama's default context is small; the persona, notes and recent chat need more room.
+  ollamaNumCtx: Number(process.env.OLLAMA_NUM_CTX) || 16384,
+  ollamaVision: process.env.OLLAMA_VISION !== '0',
   vapidSubject: (process.env.VAPID_SUBJECT || '').trim(),
   vapidPublicKey: (process.env.VAPID_PUBLIC_KEY || '').trim(),
   vapidPrivateKey: (process.env.VAPID_PRIVATE_KEY || '').trim(),

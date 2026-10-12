@@ -8,7 +8,7 @@ import { state, save, flush, addMessage, publicMessage } from './store.js';
 import { requireAuth, login, logout, isAuthed } from './auth.js';
 import { applySettingsPatch, FREQUENCIES } from './settings.js';
 import { saveUpload, UploadError, attachmentPath, deleteAllAttachments } from './attachments.js';
-import { generateReply, maybeUpdateMemory, friendlyMessage } from './ai.js';
+import { generateReply, maybeUpdateMemory, friendlyMessage, providerInfo } from './ai.js';
 import { vapidPublicKey, addSubscription, removeSubscription, notifyAll, notifyMessage } from './push.js';
 import { startScheduler, reschedule, noteUserActivity, sendCheckinNow } from './scheduler.js';
 import { buildMobileConfig } from './profile.js';
@@ -125,6 +125,12 @@ function checkinStatus() {
 const PAGE = 120;
 
 api.get('/state', (req, res) => {
+  // Remember the https address the app is reached at (also through a tunnel), for push notifications.
+  const origin = `${req.protocol}://${req.get('host')}`;
+  if (req.protocol === 'https' && state.origin !== origin) {
+    state.origin = origin;
+    save();
+  }
   const recent = state.messages.slice(-PAGE);
   res.json({
     settings: state.settings,
@@ -134,7 +140,7 @@ api.get('/state', (req, res) => {
     memory: { text: state.memory.text, updatedAt: state.memory.updatedAt },
     push: { publicKey: vapidPublicKey, devices: state.pushSubscriptions.length },
     checkin: checkinStatus(),
-    server: { demo: config.mockAI, hasApiKey: config.hasApiKey || config.mockAI },
+    server: { demo: config.mockAI, hasApiKey: config.hasApiKey || config.mockAI, ...providerInfo() },
   });
 });
 
@@ -335,10 +341,30 @@ app.use((req, res) => {
 const server = app.listen(config.port, () => {
   console.log(`\n  ${state.settings.therapistName} is listening on http://localhost:${config.port}`);
   if (config.mockAI) console.log('  Demo mode: replies are canned (MOCK_AI=1). Set ANTHROPIC_API_KEY for the real thing.');
-  else if (!config.hasApiKey) console.log('  Warning: ANTHROPIC_API_KEY is not set, so replies will fail until you add it.');
-  else console.log(`  Model: ${config.model}`);
+  else if (config.aiProvider === 'anthropic') console.log(`  AI: Claude (${config.model})`);
+  else checkOllama();
   console.log(`  iPhone install page: ${config.publicUrl || `http://localhost:${config.port}`}/install\n`);
 });
+
+// Free local mode: say clearly whether Ollama and the model are ready.
+async function checkOllama() {
+  const model = config.ollamaModel;
+  try {
+    const res = await fetch(`${config.ollamaUrl}/api/tags`);
+    const names = ((await res.json()).models || []).map((m) => m.name);
+    const ready = names.some((n) => n === model || n === `${model}:latest` || n.split(':')[0] === model);
+    console.log(
+      ready
+        ? `  AI: ${model} running free on this computer with Ollama.`
+        : `  AI: Ollama is running, but the ${model} model isn't downloaded yet. Run:  ollama pull ${model}`,
+    );
+  } catch {
+    console.log(
+      `  AI: no ANTHROPIC_API_KEY, so it uses Ollama (free, on this computer), but Ollama isn't running at ${config.ollamaUrl}.\n` +
+        '      Install it from https://ollama.com, then run:  ollama pull ' + model,
+    );
+  }
+}
 
 startScheduler();
 

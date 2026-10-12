@@ -948,9 +948,16 @@ function fillSettings() {
 // Free Cloudflare version: how much of today's free AI allowance is used.
 function renderFreeUsage() {
   const card = $('#freeCard');
+  if (S.server.provider === 'ollama') {
+    card.hidden = false;
+    $('#freeMeter').parentElement.hidden = true;
+    $('#freeInfo').textContent = `Running free and privately on your own computer with Ollama (${S.server.model}). No daily limit, but your computer needs to be on and awake for replies and check-ins.`;
+    return;
+  }
   const u = S.server.usage;
   card.hidden = S.server.provider !== 'workers-ai' || !u;
   if (card.hidden) return;
+  $('#freeMeter').parentElement.hidden = false;
   const pct = Math.min(100, Math.round((u.neurons / u.limit) * 100));
   const reset = new Date(Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth(), new Date().getUTCDate() + 1));
   $('#freeMeter').style.width = `${pct}%`;
@@ -1157,7 +1164,10 @@ async function refreshNotifUI() {
   if (support === 'unsupported') {
     btn.textContent = 'Unavailable';
     btn.disabled = true;
-    hint.textContent = "This browser can't show notifications. Check-ins will still be waiting in the chat when you open the app.";
+    hint.textContent =
+      isIOS() && isStandalone()
+        ? "This Home Screen app can't get notifications. iPhone reliably allows them for apps added from Safari: open this site in Safari, tap Share → Add to Home Screen, and turn notifications on in that copy (iOS 16.4+). Check-ins still wait in the chat either way."
+        : "This browser can't show notifications. Check-ins will still be waiting in the chat when you open the app.";
     return;
   }
   const sub = await currentSubscription().catch(() => null);

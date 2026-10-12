@@ -24,6 +24,16 @@ export function saveVoicePrefs() {
 }
 
 export const canListen = Boolean(SR);
+
+// After the mic is used, iPhone keeps the audio session in "play and record" mode, which makes read-aloud
+// quiet or play through the earpiece. Switch it back once listening ends (iOS 16.4+).
+function micSession(on) {
+  try {
+    if (navigator.audioSession) navigator.audioSession.type = on ? 'play-and-record' : 'playback';
+  } catch {
+    // not supported
+  }
+}
 export const canSpeak = Boolean(synth);
 
 // ---------- Listening ----------
@@ -66,14 +76,17 @@ export function listen({ onText, onEnd, onError, silenceMs = 1800 }) {
   };
   rec.onend = () => {
     clearTimeout(silenceTimer);
+    micSession(false);
     if (ended) return;
     ended = true;
     onEnd?.(aborted ? '' : text);
   };
 
   try {
+    micSession(true);
     rec.start();
   } catch (err) {
+    micSession(false);
     ended = true;
     onError?.(err.name === 'InvalidStateError' ? 'busy' : 'not-allowed');
     return { stop() {}, abort() {} };
@@ -258,6 +271,7 @@ export function record({ onEnd, onError, silenceMs = 1600, maxMs = 60000, onStar
     cancelAnimationFrame(raf);
     clearTimeout(timer);
     stream?.getTracks().forEach((t) => t.stop());
+    micSession(false);
     try {
       if (aborted || !heard || !chunks.length) return onEnd(null);
       onEnd(await toWav16k(new Blob(chunks, { type: recorder.mimeType || 'audio/mp4' }), ctx));
@@ -273,9 +287,11 @@ export function record({ onEnd, onError, silenceMs = 1600, maxMs = 60000, onStar
       // Create the audio context during the tap (iOS requires a user gesture), then ask for the mic.
       ctx = new AC();
       if (ctx.state === 'suspended') await ctx.resume().catch(() => {});
+      micSession(true);
       stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
     } catch (err) {
       done = true;
+      micSession(false);
       ctx?.close().catch(() => {});
       return onError?.(err?.name === 'NotAllowedError' ? 'not-allowed' : 'no-mic');
     }

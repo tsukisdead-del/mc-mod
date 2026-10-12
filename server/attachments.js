@@ -1,6 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import mammoth from 'mammoth';
+import { extractText, getDocumentProxy } from 'unpdf';
+import { config } from './config.js';
 import { state, save, newId, UPLOAD_DIR } from './store.js';
 import { classify, cleanName, checkText, filePlaceholder, UploadError } from './file-types.js';
 
@@ -32,8 +34,34 @@ export async function saveUpload(file) {
   }
 
   state.attachments[id] = meta;
+  // Local open models can't read PDFs directly, so pull the text out now (and catch scans early).
+  if (kind === 'pdf' && config.aiProvider === 'ollama') {
+    let text = '';
+    try {
+      text = await pdfText(meta);
+    } catch {
+      // handled below
+    }
+    if (!text.trim()) {
+      delete state.attachments[id];
+      await fs.promises.rm(path.join(UPLOAD_DIR, fileName), { force: true });
+      throw new UploadError("I couldn't find any text in that PDF (it might be a scan). Send it as a photo instead.");
+    }
+  }
   save();
   return meta;
+}
+
+// Text of a PDF, extracted once and cached next to the file.
+export async function pdfText(meta) {
+  if (meta.textFile) return fs.promises.readFile(path.join(UPLOAD_DIR, meta.textFile), 'utf8');
+  const doc = await getDocumentProxy(new Uint8Array(await fs.promises.readFile(attachmentPath(meta))));
+  const { text } = await extractText(doc, { mergePages: true });
+  const clean = checkText(text);
+  meta.textFile = meta.id + '.txt';
+  await fs.promises.writeFile(path.join(UPLOAD_DIR, meta.textFile), clean, { mode: 0o600 });
+  save();
+  return clean;
 }
 
 export function attachmentPath(meta) {
@@ -62,6 +90,35 @@ export async function attachmentBlocks(ids) {
     }
   }
   return blocks;
+}
+
+// Parts for local open models (Ollama): photos as base64 (only those in `fresh`, the turn being answered,
+// since re-sending old photos costs a lot of context), documents as text.
+export async function openModelParts(ids, { fresh, vision, maxChars }) {
+  const parts = [];
+  for (const id of ids || []) {
+    const meta = state.attachments[id];
+    if (!meta) continue;
+    try {
+      if (meta.kind === 'image') {
+        if (vision && fresh.has(id)) {
+          parts.push({ type: 'image', mime: meta.mime, data: (await fs.promises.readFile(attachmentPath(meta))).toString('base64') });
+        } else {
+          parts.push({ type: 'text', text: `[They sent a photo: ${meta.name}${vision ? '' : " (you can't see photos, so ask them to describe it)"}]` });
+        }
+        continue;
+      }
+      const text = meta.kind === 'pdf' ? await pdfText(meta) : await fs.promises.readFile(path.join(UPLOAD_DIR, meta.textFile), 'utf8');
+      const cut = text.length > maxChars;
+      parts.push({
+        type: 'text',
+        text: `[Document they sent: "${meta.name}"]\n${cut ? text.slice(0, maxChars) : text}${cut ? '\n[Only the first part of this document fit; say so if it matters.]' : ''}`,
+      });
+    } catch (err) {
+      console.error(`Attachment ${id} could not be read:`, err.message);
+    }
+  }
+  return parts;
 }
 
 // Short description used once a file is too old to resend in full.
