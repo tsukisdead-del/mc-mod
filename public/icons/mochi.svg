@@ -1,0 +1,87 @@
+<svg xmlns="http://www.w3.org/2000/svg" class="mochi" viewBox="0 0 200 200" role="img" aria-label="Dr. Mochi">
+  <style>.m-mouth,.m-eyes-happy,.m-extra{display:none}.m-mouth-warm{display:inline}.m-cheeks{opacity:.45}.m-shadow{fill:#000;opacity:.08}</style><defs>
+    <radialGradient id="s-skin" cx="42%" cy="34%" r="78%">
+      <stop offset="0" stop-color="#FFF6EF"/>
+      <stop offset=".55" stop-color="#FFE2D2"/>
+      <stop offset="1" stop-color="#F5BEA8"/>
+    </radialGradient>
+    <linearGradient id="s-sweater" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#9ACDB4"/>
+      <stop offset="1" stop-color="#78B396"/>
+    </linearGradient>
+  </defs>
+  <ellipse class="m-shadow" cx="100" cy="191" rx="54" ry="6"/>
+  <g class="m-all">
+    <g class="m-torso">
+      <path d="M36 196 C38 156 64 141 100 141 C136 141 162 156 164 196 Z" fill="url(#s-sweater)"/>
+      <path d="M84 142 L100 163 L116 142" fill="none" stroke="#FFFDF9" stroke-width="5" stroke-linejoin="round" stroke-linecap="round"/>
+      <circle cx="100" cy="176" r="3.2" fill="#FFFDF9" opacity=".9"/>
+      <circle cx="100" cy="189" r="3.2" fill="#FFFDF9" opacity=".9"/>
+    </g>
+    <g class="m-head">
+      <g class="m-sprout">
+        <path d="M100 34 C100 25 99 19 96 13" stroke="#56A37A" stroke-width="4" fill="none" stroke-linecap="round"/>
+        <path d="M96.5 17 C86 4 71 7 68 14 C78 23 91 23 96.5 17 Z" fill="#7CC59A"/>
+        <path d="M98.5 19 C108 6 123 8 126 15 C117 23 105 24 98.5 19 Z" fill="#68B88A"/>
+      </g>
+      <path class="m-face" d="M100 31 C151 31 173 66 171 102 C169 139 141 154 100 154 C59 154 31 139 29 102 C27 66 49 31 100 31 Z" fill="url(#s-skin)"/>
+      <ellipse cx="72" cy="52" rx="16" ry="8" fill="#fff" opacity=".45" transform="rotate(-18 72 52)"/>
+      <g class="m-cheeks" fill="#FF8DA1">
+        <ellipse cx="55" cy="116" rx="12.5" ry="7.5"/>
+        <ellipse cx="145" cy="116" rx="12.5" ry="7.5"/>
+      </g>
+      <g class="m-brows" stroke="#4A3A52" stroke-width="4" stroke-linecap="round" fill="none">
+        <path class="m-brow-l" d="M61 64 Q73 58 85 63"/>
+        <path class="m-brow-r" d="M115 63 Q127 58 139 64"/>
+      </g>
+      <g class="m-eyes">
+        <g class="m-eyes-open">
+          <g class="m-pupils">
+            <ellipse cx="74" cy="91" rx="6.6" ry="8.2" fill="#2E2340"/>
+            <circle cx="76.6" cy="87.6" r="2.3" fill="#fff"/>
+            <ellipse cx="126" cy="91" rx="6.6" ry="8.2" fill="#2E2340"/>
+            <circle cx="128.6" cy="87.6" r="2.3" fill="#fff"/>
+          </g>
+        </g>
+        <g class="m-eyes-happy" stroke="#2E2340" stroke-width="4.2" stroke-linecap="round" fill="none">
+          <path d="M65.5 94 Q74 83 82.5 94"/>
+          <path d="M117.5 94 Q126 83 134.5 94"/>
+        </g>
+      </g>
+      <g class="m-glasses" fill="none" stroke="#3B2F4A" stroke-width="4.2" stroke-linecap="round">
+        <circle cx="74" cy="91" r="19.5" fill="#fff" fill-opacity=".16"/>
+        <circle cx="126" cy="91" r="19.5" fill="#fff" fill-opacity=".16"/>
+        <path d="M93.5 88 Q100 82.5 106.5 88"/>
+        <path d="M54.5 86 L37 79"/>
+        <path d="M145.5 86 L163 79"/>
+        <path d="M63 81 Q67 76 73 75" stroke="#fff" stroke-width="2.6" opacity=".75"/>
+        <path d="M115 81 Q119 76 125 75" stroke="#fff" stroke-width="2.6" opacity=".75"/>
+      </g>
+      <g class="m-mouths" stroke="#2E2340" stroke-width="4.2" stroke-linecap="round" stroke-linejoin="round">
+        <path class="m-mouth m-mouth-warm" d="M88 124 Q100 134 112 124" fill="none"/>
+        <path class="m-mouth m-mouth-happy" d="M85 121 Q100 140 115 121 Z" fill="#7A3B4F"/>
+        <g class="m-mouth m-mouth-laughing">
+          <path d="M82 118 Q100 148 118 118 Z" fill="#7A3B4F"/>
+          <path d="M91 133 Q100 128 109 133 Q104 140 100 140 Q96 140 91 133 Z" fill="#FF8DA1" stroke="none"/>
+        </g>
+        <path class="m-mouth m-mouth-thinking" d="M92 128 Q101 124 110 126" fill="none"/>
+        <path class="m-mouth m-mouth-concerned" d="M89 129 Q100 121 111 129" fill="none"/>
+        <ellipse class="m-mouth m-mouth-curious" cx="101" cy="126" rx="5" ry="6" fill="#7A3B4F"/>
+        <ellipse class="m-mouth m-mouth-talk" cx="100" cy="125" rx="9.5" ry="7.5" fill="#7A3B4F"/>
+      </g>
+    </g>
+    <g class="m-extra m-dots" fill="#B9A9D9">
+      <circle cx="160" cy="44" r="4.5"/><circle cx="173" cy="32" r="6"/><circle cx="188" cy="16" r="8"/>
+    </g>
+    <g class="m-extra m-sparkles" fill="#FFC94D">
+      <path d="M30 40 l3 8 8 3 -8 3 -3 8 -3 -8 -8 -3 8 -3 Z"/>
+      <path d="M170 56 l2 6 6 2 -6 2 -2 6 -2 -6 -6 -2 6 -2 Z"/>
+    </g>
+    <g class="m-extra m-heart" fill="#FF8DA1">
+      <path d="M168 40 c-4 -8 -16 -6 -15 3 c1 6 8 10 15 15 c7 -5 14 -9 15 -15 c1 -9 -11 -11 -15 -3 Z"/>
+    </g>
+    <g class="m-extra m-ears" stroke="#B9A9D9" stroke-width="3.5" stroke-linecap="round" fill="none">
+      <path d="M18 92 Q12 101 18 110"/><path d="M10 86 Q0 101 10 116"/>
+    </g>
+  </g>
+</svg>

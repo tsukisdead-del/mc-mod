@@ -1,0 +1,27 @@
+{
+  "name": "mochi-therapy-texting",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Text with Dr. Mochi, a cartoon AI therapist. Installable on iPhone via a configuration profile.",
+  "type": "module",
+  "main": "server/index.js",
+  "scripts": {
+    "start": "node server/index.js",
+    "dev": "node --watch server/index.js",
+    "demo": "MOCK_AI=1 ACCESS_CODE=demo node server/index.js",
+    "icons": "node scripts/make-icons.mjs",
+    "profile": "node scripts/make-profile.mjs",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20.12"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.133.0",
+    "express": "^5.1.0",
+    "mammoth": "^1.11.0",
+    "multer": "^2.0.2",
+    "qrcode": "^1.5.4",
+    "web-push": "^3.6.7"
+  }
+}

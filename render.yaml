@@ -1,0 +1,23 @@
+# One-click deploy on Render: https://render.com/deploy
+# A paid instance is needed so the app stays awake (for check-ins) and keeps its disk (for your chats).
+services:
+  - type: web
+    name: dr-mochi
+    runtime: node
+    plan: starter
+    buildCommand: npm ci --omit=dev
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: ACCESS_CODE
+        sync: false
+      - key: DATA_DIR
+        value: /var/data
+      - key: NODE_VERSION
+        value: "22"
+    disk:
+      name: mochi-data
+      mountPath: /var/data
+      sizeGB: 1

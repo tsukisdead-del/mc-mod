@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Dr. Mochi</title>
+    <meta name="description" content="Text with Dr. Mochi, your cartoon AI therapist." />
+    <meta name="theme-color" content="#FFF7F0" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#17121E" media="(prefers-color-scheme: dark)" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <meta name="apple-mobile-web-app-title" content="Dr. Mochi" />
+    <meta name="format-detection" content="telephone=no" />
+    <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
+    <link rel="icon" type="image/png" href="/icons/icon-192.png" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="stylesheet" href="/styles.css" />
+    <script type="module" src="/js/app.js"></script>
+  </head>
+  <body>
+    <div id="boot" class="boot"><div class="boot-dot"></div></div>
+
+    <!-- Unlock -->
+    <section id="login" class="screen login" hidden>
+      <div class="login-card">
+        <div class="avatar avatar-xl" data-avatar></div>
+        <h1>Hi, I'm <span data-tname>Dr. Mochi</span></h1>
+        <p class="muted">Type your access code to unlock your chats.</p>
+        <form id="loginForm" autocomplete="on">
+          <input id="codeInput" type="password" name="password" autocomplete="current-password" placeholder="Access code" required />
+          <button type="submit" class="btn-primary">Unlock</button>
+        </form>
+        <p id="loginError" class="error" role="alert"></p>
+      </div>
+    </section>
+
+    <!-- Chat -->
+    <section id="chat" class="screen chat" hidden>
+      <header class="topbar">
+        <button id="helpBtn" class="icon-btn" aria-label="Get help now" title="Get help now">
+          <svg viewBox="0 0 24 24" width="24" height="24" aria-hidden="true"><path d="M12 20.5s-7.5-4.6-7.5-10.2A4.3 4.3 0 0 1 12 7.6a4.3 4.3 0 0 1 7.5 2.7c0 5.6-7.5 10.2-7.5 10.2Z" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round"/><path d="M12 10.5v5M9.5 13h5" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/></svg>
+        </button>
+        <button id="whoBtn" class="who" aria-label="Open voice mode">
+          <span class="avatar avatar-sm" data-avatar></span>
+          <span class="who-text">
+            <span class="who-name" data-tname>Dr. Mochi</span>
+            <span id="status" class="status">here for you</span>
+          </span>
+        </button>
+        <button id="settingsBtn" class="icon-btn" aria-label="Settings" title="Settings">
+          <svg viewBox="0 0 24 24" width="24" height="24" aria-hidden="true"><path d="M4 7h10M18 7h2M4 17h4M12 17h8" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/><circle cx="16" cy="7" r="2.2" fill="none" stroke="currentColor" stroke-width="1.9"/><circle cx="10" cy="17" r="2.2" fill="none" stroke="currentColor" stroke-width="1.9"/></svg>
+        </button>
+      </header>
+
+      <main id="scroller" class="scroller">
+        <div id="demoNote" class="demo-note" hidden>Demo mode: replies are canned. Add an ANTHROPIC_API_KEY on the server for real conversations.</div>
+        <button id="loadEarlier" class="load-earlier" hidden>Load earlier messages</button>
+        <div id="thread" class="thread" aria-live="polite"></div>
+      </main>
+
+      <footer class="composer">
+        <div id="pendingFiles" class="pending-files" hidden></div>
+        <div class="composer-row">
+          <button id="attachBtn" class="round-btn ghost" aria-label="Add a photo or file">
+            <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></svg>
+          </button>
+          <div class="input-wrap">
+            <textarea id="input" rows="1" placeholder="Text Dr. Mochi" enterkeyhint="send" autocomplete="off"></textarea>
+          </div>
+          <button id="micBtn" class="round-btn ghost" aria-label="Talk out loud">
+            <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><rect x="9" y="3.5" width="6" height="11" rx="3" fill="none" stroke="currentColor" stroke-width="1.9"/><path d="M6 11.5a6 6 0 0 0 12 0M12 17.5v3" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/></svg>
+          </button>
+          <button id="sendBtn" class="round-btn send" aria-label="Send" hidden>
+            <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M12 19V6M6.5 11.5 12 6l5.5 5.5" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+        </div>
+        <input type="file" id="photoInput" accept="image/*" multiple hidden />
+        <input type="file" id="cameraInput" accept="image/*" capture="environment" hidden />
+        <input type="file" id="docInput" accept=".pdf,.docx,.txt,.md,.csv,.json,application/pdf,text/plain,application/vnd.openxmlformats-officedocument.wordprocessingml.document" multiple hidden />
+      </footer>
+    </section>
+
+    <!-- Attach menu -->
+    <div id="attachMenu" class="action-sheet" hidden>
+      <div class="action-group">
+        <button data-pick="photo"><span aria-hidden="true">🖼️</span> Photo library</button>
+        <button data-pick="camera"><span aria-hidden="true">📷</span> Take a photo</button>
+        <button data-pick="doc"><span aria-hidden="true">📄</span> Document (PDF, Word, text)</button>
+      </div>
+      <div class="action-group"><button data-pick="cancel" class="cancel">Cancel</button></div>
+    </div>
+
+    <!-- Voice mode -->
+    <section id="voice" class="voice" hidden aria-label="Voice mode">
+      <button id="voiceClose" class="voice-close" aria-label="Close voice mode">
+        <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></svg>
+      </button>
+      <div class="voice-stage">
+        <div class="avatar avatar-xxl" data-avatar></div>
+        <div id="voiceStatus" class="voice-status">Listening…</div>
+        <div id="voiceReply" class="voice-reply"></div>
+        <div id="voiceHeard" class="voice-heard"></div>
+      </div>
+      <div class="voice-controls">
+        <label class="mini-toggle"><input type="checkbox" id="vmHandsFree" /> <span>Hands-free</span></label>
+        <button id="voiceMain" class="voice-main" aria-label="Talk">
+          <svg class="ic-mic" viewBox="0 0 24 24" width="34" height="34" aria-hidden="true"><rect x="9" y="3.5" width="6" height="11" rx="3" fill="currentColor"/><path d="M6 11.5a6 6 0 0 0 12 0M12 17.5v3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+          <svg class="ic-stop" viewBox="0 0 24 24" width="30" height="30" aria-hidden="true"><rect x="6.5" y="6.5" width="11" height="11" rx="2.5" fill="currentColor"/></svg>
+        </button>
+        <label class="mini-toggle"><input type="checkbox" id="vmReadAloud" /> <span>Speak replies</span></label>
+      </div>
+    </section>
+
+    <!-- Settings -->
+    <section id="settings" class="sheet" hidden aria-label="Settings">
+      <div class="sheet-head">
+        <h2>Settings</h2>
+        <button class="text-btn" data-close>Done</button>
+      </div>
+      <div class="sheet-body">
+        <div class="card">
+          <div class="card-title"><h3>Tone</h3><span class="avatar avatar-tiny" data-avatar></span></div>
+          <p class="hint">How do you want <span data-tname>Dr. Mochi</span> to talk to you?</p>
+          <input type="range" id="tone" min="0" max="100" step="1" class="tone-slider" aria-describedby="toneDesc" />
+          <div class="tone-ends"><span>Gentle &amp; therapeutic</span><span>Balanced</span><span>Keep it real</span></div>
+          <div class="tone-readout"><strong id="toneLabel">Balanced</strong><span id="toneValue">50</span></div>
+          <p class="hint" id="toneDesc"></p>
+          <label class="row"><span>Cursing</span><input type="checkbox" class="switch" id="allowCursing" /></label>
+          <label class="row"><span>Emojis</span><input type="checkbox" class="switch" id="emojis" /></label>
+        </div>
+
+        <div class="card">
+          <h3>Check-ins</h3>
+          <p class="hint"><span data-tname>Dr. Mochi</span> texts you first to see how you're doing, and follows up on things you've talked about.</p>
+          <label class="row"><span>Text me first</span><input type="checkbox" class="switch" id="ciEnabled" /></label>
+          <div id="ciOptions">
+            <label class="row"><span>How often</span><select id="ciFrequency"></select></label>
+            <div class="row"><span>Between</span><span class="hours"><select id="ciStart" aria-label="Start time"></select><span>and</span><select id="ciEnd" aria-label="End time"></select></span></div>
+            <p class="hint">What should check-ins be about?</p>
+            <div class="chips" id="ciStyles">
+              <label class="chip"><input type="checkbox" value="mood" /><span>How I'm feeling</span></label>
+              <label class="chip"><input type="checkbox" value="followups" /><span>Follow-ups on what we talked about</span></label>
+              <label class="chip"><input type="checkbox" value="encouragement" /><span>Encouragement</span></label>
+              <label class="chip"><input type="checkbox" value="selfcare" /><span>Self-care reminders</span></label>
+            </div>
+            <p class="hint" id="ciNext"></p>
+          </div>
+          <div class="divider"></div>
+          <div class="row"><span>Notifications on this device</span><button id="notifBtn" class="pill">Turn on</button></div>
+          <p class="hint" id="notifHint"></p>
+          <label class="row"><span>Notify me when a reply finishes after I leave the app</span><input type="checkbox" class="switch" id="replyNotifs" /></label>
+          <div class="btn-row">
+            <button id="checkinNow" class="pill">Send me a check-in now</button>
+            <button id="testPush" class="pill">Test notification</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <h3>Voice</h3>
+          <p class="hint" id="voiceSupport"></p>
+          <label class="row"><span>Read replies out loud</span><input type="checkbox" class="switch" id="readAloud" /></label>
+          <label class="row"><span>Voice</span><select id="voiceSelect"></select></label>
+          <label class="row"><span>Speed</span><input type="range" id="voiceRate" min="0.7" max="1.4" step="0.05" /></label>
+          <label class="row"><span>Send when I stop talking</span><input type="checkbox" class="switch" id="autoSend" /></label>
+          <label class="row"><span>Hands-free (keep listening after replies)</span><input type="checkbox" class="switch" id="handsFree" /></label>
+          <div class="btn-row"><button id="voicePreview" class="pill">Preview voice</button></div>
+        </div>
+
+        <div class="card">
+          <h3>Personalize</h3>
+          <label class="field"><span>Therapist's name</span><input id="therapistName" maxlength="40" autocomplete="off" /></label>
+          <label class="field"><span>What should they call you?</span><input id="userName" maxlength="40" autocomplete="given-name" /></label>
+        </div>
+
+        <div class="card">
+          <h3>What <span data-tname>Dr. Mochi</span> remembers</h3>
+          <p class="hint">Private notes that carry over between chats, updated as you talk. You can edit or erase them.</p>
+          <textarea id="memory" rows="7" placeholder="Nothing yet."></textarea>
+          <div class="btn-row">
+            <button id="memorySave" class="pill">Save notes</button>
+            <button id="memoryRefresh" class="pill">Update from recent chats</button>
+            <button id="memoryClear" class="pill danger">Erase</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <h3>Put it on your iPhone</h3>
+          <p class="hint">Download the install profile to add <span data-tname>Dr. Mochi</span> to your Home Screen as an app.</p>
+          <div class="btn-row"><a class="pill" href="/install">iPhone install page</a></div>
+        </div>
+
+        <div class="card">
+          <h3>Your data</h3>
+          <div class="btn-row">
+            <a class="pill" href="/api/export" download="my-chats.json">Download my chats</a>
+            <button id="clearChat" class="pill danger">Delete chat history</button>
+            <button id="lockApp" class="pill">Lock app</button>
+          </div>
+        </div>
+
+        <p class="disclaimer"><span data-tname>Dr. Mochi</span> is an AI, not a licensed therapist, and can get things wrong. It isn't for emergencies. If you might hurt yourself or someone else, call or text 988 (US) or your local emergency number.</p>
+      </div>
+    </section>
+
+    <!-- Help -->
+    <section id="help" class="sheet" hidden aria-label="Get help now">
+      <div class="sheet-head">
+        <h2>Get help now</h2>
+        <button class="text-btn" data-close>Done</button>
+      </div>
+      <div class="sheet-body">
+        <p class="help-lead">You don't have to go through this alone. Real people are available 24/7, for free.</p>
+        <div class="help-list">
+          <a class="help-item" href="tel:988"><strong>Call 988</strong><span>Suicide &amp; Crisis Lifeline (US)</span></a>
+          <a class="help-item" href="sms:988"><strong>Text 988</strong><span>Same lifeline, by text</span></a>
+          <a class="help-item" href="sms:741741&amp;body=HOME"><strong>Text HOME to 741741</strong><span>Crisis Text Line (US)</span></a>
+          <a class="help-item" href="https://findahelpline.com" target="_blank" rel="noopener noreferrer"><strong>Outside the US</strong><span>findahelpline.com lists free helplines by country</span></a>
+          <a class="help-item urgent" href="tel:911"><strong>Call 911</strong><span>If you or someone else is in immediate danger</span></a>
+        </div>
+      </div>
+    </section>
+
+    <div id="toast" class="toast" role="status" hidden></div>
+  </body>
+</html>

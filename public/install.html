@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Install on iPhone</title>
+    <meta name="theme-color" content="#FFF7F0" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-title" content="Dr. Mochi" />
+    <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
+    <link rel="icon" type="image/png" href="/icons/icon-192.png" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="stylesheet" href="/styles.css" />
+    <link rel="stylesheet" href="/install.css" />
+    <script type="module" src="/js/install.js"></script>
+  </head>
+  <body>
+    <main class="install">
+      <header class="install-hero">
+        <img src="/icons/apple-touch-icon.png" alt="" width="96" height="96" class="app-icon" />
+        <h1>Put <span data-tname>Dr. Mochi</span> on your iPhone</h1>
+        <p class="muted">Install it like an app: its own Home Screen icon, full screen, with check-in notifications.</p>
+      </header>
+
+      <div id="warnHttp" class="callout warn" hidden>
+        <strong>This address isn't secure (https).</strong> The microphone, notifications, and offline mode need https.
+        Deploy the app to a host that gives you an https address (see the README), then open that address on your iPhone.
+      </div>
+
+      <section id="notIphone" class="card" hidden>
+        <h2>Open this page on your iPhone</h2>
+        <p>Scan this with your iPhone camera, or send yourself the link and open it in <strong>Safari</strong>.</p>
+        <img id="qr" class="qr" alt="QR code for this page" width="220" height="220" />
+        <p class="link-box"><code id="pageUrl"></code></p>
+      </section>
+
+      <section id="inApp" class="card" hidden>
+        <h2>You're already in the app 🎉</h2>
+        <p>Next, open <strong>Settings</strong> (the sliders icon, top right) and turn on <strong>Notifications</strong> so check-ins can reach you.</p>
+        <p><a class="btn-primary link-btn" href="/">Back to chatting</a></p>
+      </section>
+
+      <section id="notSafari" class="callout warn" hidden>
+        <strong>Open this page in Safari.</strong> iPhone only installs profiles and Home Screen apps from Safari. Copy the link and paste it into Safari.
+      </section>
+
+      <section class="card" id="profileSteps">
+        <h2><span class="step-badge">Option 1</span> Install profile</h2>
+        <ol class="steps">
+          <li>
+            <a id="downloadProfile" class="btn-primary link-btn" href="/app.mobileconfig">Download install profile</a>
+            <span class="muted small">When Safari asks to download a configuration profile, tap <strong>Allow</strong>, then <strong>Close</strong>.</span>
+          </li>
+          <li>Open the <strong>Settings</strong> app and tap <strong>Profile Downloaded</strong> near the top. (If you don't see it: Settings › General › VPN &amp; Device Management.)</li>
+          <li>Tap <strong>Install</strong>, enter your iPhone passcode, then tap <strong>Install</strong> again. It shows "Not Verified" because it's your own personal profile and not signed by a company. That's expected.</li>
+          <li>Go to your Home Screen and open <strong data-tname>Dr. Mochi</strong>. Type your access code.</li>
+          <li>In the app, open <strong>Settings</strong> (top right) and turn on <strong>Notifications</strong> so <span data-tname>Dr. Mochi</span> can text you first.</li>
+        </ol>
+        <p class="muted small">The profile only adds a Home Screen icon. It doesn't manage, track, or change anything else on your phone. Remove it any time from Settings › General › VPN &amp; Device Management.</p>
+      </section>
+
+      <section class="card">
+        <h2><span class="step-badge">Option 2</span> Add to Home Screen</h2>
+        <p>The quick way, and the most reliable for notifications:</p>
+        <ol class="steps">
+          <li>Open this site in <strong>Safari</strong>.</li>
+          <li>Tap the <strong>Share</strong> button (the square with an arrow).</li>
+          <li>Scroll down and tap <strong>Add to Home Screen</strong>, then <strong>Add</strong>.</li>
+        </ol>
+        <p class="muted small">If you used the profile and the app never asks for notification permission, delete that icon and add it this way instead. Notifications need iOS 16.4 or newer.</p>
+      </section>
+
+      <p class="center"><a href="/">Open the app in this browser instead</a></p>
+    </main>
+  </body>
+</html>
