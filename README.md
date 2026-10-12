@@ -1,6 +1,8 @@
 # Dr. Mochi: a cartoon AI therapist you can text
 
-A private texting app where you talk to **Dr. Mochi**, a cartoon therapist powered by Claude. You type or talk out loud, and it texts back. You can send it photos and documents to look at, it texts *you* first to check in, and a slider controls how gentle or how real it is with you. It installs on your iPhone like a normal app.
+A private texting app where you talk to **Dr. Mochi**, a cartoon AI therapist. You type or talk out loud, and it texts back. You can send it photos and documents to look at, it texts *you* first to check in, and a slider controls how gentle or how real it is with you. It installs on your iPhone like a normal app.
+
+**It can run completely free** on Cloudflare's free plan, using Google's open Gemma 4 model, or with Claude for the best conversations (you pay per message). Same app, same features. See [Two ways to run it](#two-ways-to-run-it).
 
 ![Dr. Mochi screens](docs/preview.png)
 
@@ -24,9 +26,65 @@ A private texting app where you talk to **Dr. Mochi**, a cartoon therapist power
 
 ---
 
-## Set it up (about 15 minutes)
+## Two ways to run it
 
-You need two things: a **Claude API key** (this is what makes Dr. Mochi think) and somewhere to **host the app** so your phone can reach it, even when your computer is off.
+| | **Free version** (Cloudflare) | **Claude version** |
+| --- | --- | --- |
+| Cost | **$0**. No credit card. | Pay per message to Anthropic (about a cent or a few cents each), plus hosting if you use Render/Railway |
+| AI | Gemma 4 (Google's open model) on Cloudflare Workers AI | Claude, the most natural and thoughtful conversations |
+| Daily limit | Roughly 250 texts a day; resets at midnight UTC | None |
+| Everything else | Same app: cartoon, voice, photos, documents, tone slider, check-in notifications, memory, iPhone profile | Same |
+| Setup | About 10 minutes, all in a browser (works from a phone) | About 15 minutes |
+
+You can start free and switch to Claude later by adding one setting, without moving your chats.
+
+---
+
+## Free version: set it up on Cloudflare (about 10 minutes)
+
+All of this happens in a web browser; you don't need a computer or any code.
+
+### 1. Make a free Cloudflare account
+
+Go to [dash.cloudflare.com/sign-up](https://dash.cloudflare.com/sign-up), sign up with your email, and click the link in the verification email. The Workers Free plan is the default, and no card is needed.
+
+### 2. Connect this app to Cloudflare
+
+1. In the Cloudflare dashboard, open **Workers & Pages** → **Create application** → **Import a repository** (Get started).
+2. Connect your GitHub account when asked. You can limit access to just the **mc-mod** repository.
+3. Pick **mc-mod**. Set the **project/Worker name to `dr-mochi`** (it must match). Leave the root directory and build command empty, and keep the deploy command `npx wrangler deploy`.
+4. Tap **Save and Deploy**. Cloudflare builds the app and creates its database automatically. When it's done you'll see an address like `https://dr-mochi.YOUR-NAME.workers.dev`.
+5. Open the Worker's **Settings → Build → Branch control** and make sure the production branch is **`claude/therapy-texting-app-sfftxo`** (the branch with the app). Turn off preview builds.
+
+From then on, every update to that branch deploys by itself.
+
+### 3. Choose your access code, right away
+
+Open your `workers.dev` address. The first screen asks you to **create an access code** (8+ characters); that becomes the password for your chats. Do this as soon as it's deployed, because until a code exists, whoever opens the address first gets to set it.
+
+Prefer to set it in Cloudflare instead? Add it before opening the app: **Settings → Variables and Secrets → Add →** type **Secret**, name `ACCESS_CODE`, then **Deploy**.
+
+### 4. Put it on your iPhone and turn on notifications
+
+Same as the Claude version: see [Put it on your iPhone](#4-put-it-on-your-iphone) and [Turn on notifications](#5-turn-on-notifications) below, using your `workers.dev` address.
+
+### Good to know about the free version
+
+- **Daily allowance.** Cloudflare gives every account 10,000 free AI "neurons" a day. That's roughly 250 typical texts with Gemma 4 (fewer if you send lots of photos or long documents). **Settings → Free AI** shows how much is left. If it runs out, Dr. Mochi says it's resting until the reset (midnight UTC), and check-ins still go out as simple messages.
+- **The AI is different.** Gemma 4 is a capable open model, but Claude is noticeably better at nuanced, emotionally intelligent conversation. The same safety rules apply, and the app also watches for crisis words itself, so the help card appears even if the model misses them.
+- **Photos** are looked at when you send them (Dr. Mochi remembers what it saw afterwards, not the photo itself). The app shrinks photos automatically.
+- **Documents.** PDFs and Word files are turned into text for free when you upload them. Very long documents are trimmed to their first ~40,000 characters. Scanned PDFs (pictures of pages) have no text, so send those as photos.
+- **Talking.** Uses your phone's speech recognition when it's available; otherwise the app records you and Cloudflare's free Whisper model writes down what you said.
+- **Privacy.** Your chats are stored in your own Cloudflare D1 database. Cloudflare says Workers AI doesn't use your messages to train models.
+- **Switch to Claude anytime.** Add a Secret named `ANTHROPIC_API_KEY` (see step 1 below) in **Settings → Variables and Secrets**. Hosting stays free; you only pay Anthropic per message.
+
+**If the first build fails** with a permissions error about D1: go to **My Profile → API Tokens → Create Token**, give it *Workers Scripts: Edit*, *D1: Edit* and *Account Settings: Read*, then pick that token under the Worker's **Settings → Build → API token** and retry the build. If it says you need a `workers.dev` subdomain, open **Workers & Pages**, choose one, and retry.
+
+---
+
+## Claude version: set it up (about 15 minutes)
+
+You need two things: a **Claude API key** (this is what makes Dr. Mochi think) and somewhere to **host the app** so your phone can reach it, even when your computer is off. (You can also use the free Cloudflare hosting above and just add your key there.)
 
 ### 1. Get a Claude API key
 
@@ -128,6 +186,14 @@ In the app, tap the **sliders icon** (top right) → **Check-ins** → **Notific
 | `VAPID_SUBJECT` | | your URL | Contact address push services can use (`mailto:` or https). |
 | `MOCK_AI` | | | Set to `1` for canned replies with no API key (demo/testing). |
 
+Cloudflare (free) version: the same names work as **Secrets** or **Variables** on the Worker (`ACCESS_CODE`, `ANTHROPIC_API_KEY`, `CLAUDE_MODEL`, `CHAT_EFFORT`, `PUBLIC_URL`, `VAPID_*`, `MOCK_AI`), plus:
+
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `AI_MODEL` | `@cf/google/gemma-4-26b-a4b-it` | The free Workers AI model. `@cf/meta/llama-4-scout-17b-16e-instruct` also sees photos. |
+
+Storage is the `DB` D1 database in `wrangler.jsonc`, created on first deploy. Check-ins run from a Cron Trigger every 5 minutes.
+
 ## Run it on your computer
 
 Requires Node.js 20.12 or newer.
@@ -138,12 +204,14 @@ npm run demo          # canned replies, access code "demo" → http://localhost:
 cp .env.example .env  # then fill in ANTHROPIC_API_KEY and ACCESS_CODE
 npm start             # the real thing
 npm test              # unit tests
+npm run cf:demo       # the Cloudflare version locally (canned replies; no account needed) → http://localhost:8787
 ```
 
 To try it on your phone before deploying, expose your computer over https, e.g. `cloudflared tunnel --url http://localhost:3000`, and open the printed address in Safari.
 
 ## How it works
 
+- `worker/`: the free Cloudflare version. The same `/api` as the Node server, so the same frontend works on both. `store.js` uses D1; `ai.js` runs Workers AI (or Claude if a key is set); `webpush.js` sends notifications with WebCrypto; the `scheduled` handler runs check-ins.
 - `server/`: Express app. `ai.js` talks to Claude with streaming, prompt caching and a server-side safety fallback; `prompts.js` holds the persona, tone bands and check-in instructions; `scheduler.js` decides when to check in; `push.js` sends Web Push notifications; `profile.js` builds the iPhone `.mobileconfig`; `store.js` keeps everything in one JSON file.
 - `public/`: the installable web app (no build step). `js/avatar.js` is the cartoon (one SVG, with expressions driven by CSS), `js/voice.js` handles speech recognition and read-aloud, and `sw.js` is the service worker for notifications and offline loading.
 - Each reply starts with a hidden `[[mood:…]]` tag that sets the cartoon's face, and uses `|||` to split into separate texts. A `[[crisis]]` tag shows the help card.

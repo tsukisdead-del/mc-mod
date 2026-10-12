@@ -191,3 +191,131 @@ export function stopSpeaking() {
   queue = 0;
   emit(false);
 }
+
+// ---------- Recording (fallback when the browser has no speech recognition) ----------
+// The free Cloudflare version can transcribe audio on the server. We record with MediaRecorder, stop after a
+// pause, and convert to 16 kHz mono WAV in the browser (iPhone records AAC, which the server may not decode).
+
+const AC = window.AudioContext || window.webkitAudioContext;
+export const canRecord = Boolean(navigator.mediaDevices?.getUserMedia && window.MediaRecorder && AC && window.OfflineAudioContext);
+
+function wavFromSamples(samples, rate) {
+  const buffer = new ArrayBuffer(44 + samples.length * 2);
+  const v = new DataView(buffer);
+  const text = (o, s) => [...s].forEach((c, i) => v.setUint8(o + i, c.charCodeAt(0)));
+  text(0, 'RIFF');
+  v.setUint32(4, 36 + samples.length * 2, true);
+  text(8, 'WAVE');
+  text(12, 'fmt ');
+  v.setUint32(16, 16, true);
+  v.setUint16(20, 1, true); // PCM
+  v.setUint16(22, 1, true); // mono
+  v.setUint32(24, rate, true);
+  v.setUint32(28, rate * 2, true);
+  v.setUint16(32, 2, true);
+  v.setUint16(34, 16, true);
+  text(36, 'data');
+  v.setUint32(40, samples.length * 2, true);
+  for (let i = 0; i < samples.length; i++) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    v.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+  return new Blob([buffer], { type: 'audio/wav' });
+}
+
+async function toWav16k(blob, ctx) {
+  const decoded = await ctx.decodeAudioData(await blob.arrayBuffer());
+  const rate = 16000;
+  const offline = new OfflineAudioContext(1, Math.max(1, Math.ceil(decoded.duration * rate)), rate);
+  const src = offline.createBufferSource();
+  src.buffer = decoded;
+  src.connect(offline.destination);
+  src.start();
+  const rendered = await offline.startRendering();
+  return wavFromSamples(rendered.getChannelData(0), rate);
+}
+
+// Records until they pause (or stop() is called). onEnd(wavBlob | null). Returns { stop(), abort() }.
+export function record({ onEnd, onError, silenceMs = 1600, maxMs = 60000, onStart }) {
+  let stream;
+  let recorder;
+  let ctx;
+  let raf;
+  let timer;
+  let heard = false;
+  let quietSince = 0;
+  let aborted = false;
+  let done = false;
+  const chunks = [];
+
+  const stop = () => {
+    if (recorder && recorder.state !== 'inactive') recorder.stop();
+  };
+
+  const finish = async () => {
+    if (done) return;
+    done = true;
+    cancelAnimationFrame(raf);
+    clearTimeout(timer);
+    stream?.getTracks().forEach((t) => t.stop());
+    try {
+      if (aborted || !heard || !chunks.length) return onEnd(null);
+      onEnd(await toWav16k(new Blob(chunks, { type: recorder.mimeType || 'audio/mp4' }), ctx));
+    } catch {
+      onError?.('decode');
+    } finally {
+      ctx?.close().catch(() => {});
+    }
+  };
+
+  (async () => {
+    try {
+      // Create the audio context during the tap (iOS requires a user gesture), then ask for the mic.
+      ctx = new AC();
+      if (ctx.state === 'suspended') await ctx.resume().catch(() => {});
+      stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+    } catch (err) {
+      done = true;
+      ctx?.close().catch(() => {});
+      return onError?.(err?.name === 'NotAllowedError' ? 'not-allowed' : 'no-mic');
+    }
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 1024;
+    ctx.createMediaStreamSource(stream).connect(analyser);
+    recorder = new MediaRecorder(stream);
+    recorder.ondataavailable = (e) => e.data.size && chunks.push(e.data);
+    recorder.onstop = finish;
+    recorder.start(250);
+    onStart?.();
+    const samples = new Float32Array(analyser.fftSize);
+    const started = performance.now();
+    const loop = () => {
+      analyser.getFloatTimeDomainData(samples);
+      let sum = 0;
+      for (const s of samples) sum += s * s;
+      const loud = Math.sqrt(sum / samples.length) > 0.02;
+      const now = performance.now();
+      if (loud) {
+        heard = true;
+        quietSince = 0;
+      } else if (heard) {
+        quietSince ||= now;
+        if (now - quietSince > silenceMs) return stop();
+      } else if (now - started > 9000) {
+        return stop(); // nothing said at all
+      }
+      raf = requestAnimationFrame(loop);
+    };
+    loop();
+    timer = setTimeout(stop, maxMs);
+  })();
+
+  return {
+    stop,
+    abort: () => {
+      aborted = true;
+      stop();
+      if (!recorder) finish();
+    },
+  };
+}

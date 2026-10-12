@@ -1,0 +1,23 @@
+// Cloudflare Workers config for the free version of Dr. Mochi.
+// Deploy: connect this repo in the Cloudflare dashboard (Workers & Pages → Create → Import a repository),
+// or run `npx wrangler deploy`. See README.md → "Free version".
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "dr-mochi",
+  "main": "worker/index.js",
+  // 2026-08-04 or later turns on Node.js compatibility (Buffer, node:crypto) by default.
+  "compatibility_date": "2026-10-01",
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    // Everything else is served straight from ./public (free and doesn't count toward request limits).
+    "run_worker_first": ["/api/*", "/app.mobileconfig", "/install.mobileconfig", "/install-qr.svg", "/manifest.webmanifest"]
+  },
+  // Workers AI: the free daily allowance powers the chat (Gemma 4 by default; set AI_MODEL to change it).
+  "ai": { "binding": "AI" },
+  // One D1 database holds chats, settings, memory and photos. Created automatically on first deploy.
+  "d1_databases": [{ "binding": "DB", "database_name": "dr-mochi" }],
+  // Every 5 minutes, check whether it's time to text you first.
+  "triggers": { "crons": ["*/5 * * * *"] },
+  "observability": { "enabled": true }
+}

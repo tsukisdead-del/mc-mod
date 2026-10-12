@@ -1,5 +1,3 @@
-import fs from 'node:fs';
-import path from 'node:path';
 import crypto from 'node:crypto';
 
 // Builds an Apple configuration profile (.mobileconfig) containing a Web Clip:
@@ -15,10 +13,11 @@ function stableUuid(seed) {
   return `${h.slice(0, 8)}-${h.slice(8, 12)}-5${h.slice(13, 16)}-${v}${h.slice(17, 20)}-${h.slice(20, 32)}`.toUpperCase();
 }
 
-export function buildMobileConfig({ url, label, iconPath }) {
+// iconBase64: the 180x180 PNG Home Screen icon, base64-encoded.
+export function buildMobileConfig({ url, label, iconBase64 }) {
   const appUrl = url.replace(/\/+$/, '') + '/';
   const host = new URL(appUrl).host;
-  const icon = fs.readFileSync(iconPath).toString('base64').replace(/(.{68})/g, '$1\n\t\t\t');
+  const icon = iconBase64.replace(/(.{68})/g, '$1\n\t\t\t');
   const profileUuid = stableUuid(`profile:${appUrl}`);
   const clipUuid = stableUuid(`webclip:${appUrl}`);
   const idBase = `app.mochi.therapy.${host.replace(/[^a-zA-Z0-9]/g, '-')}`;
@@ -77,8 +76,4 @@ export function buildMobileConfig({ url, label, iconPath }) {
 </dict>
 </plist>
 `;
-}
-
-export function defaultIconPath(publicDir) {
-  return path.join(publicDir, 'icons', 'apple-touch-icon.png');
 }

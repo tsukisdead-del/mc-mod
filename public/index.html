@@ -26,10 +26,10 @@
       <div class="login-card">
         <div class="avatar avatar-xl" data-avatar></div>
         <h1>Hi, I'm <span data-tname>Dr. Mochi</span></h1>
-        <p class="muted">Type your access code to unlock your chats.</p>
+        <p id="loginHint" class="muted">Type your access code to unlock your chats.</p>
         <form id="loginForm" autocomplete="on">
           <input id="codeInput" type="password" name="password" autocomplete="current-password" placeholder="Access code" required />
-          <button type="submit" class="btn-primary">Unlock</button>
+          <button id="loginBtn" type="submit" class="btn-primary">Unlock</button>
         </form>
         <p id="loginError" class="error" role="alert"></p>
       </div>
@@ -165,6 +165,12 @@
           <label class="row"><span>Send when I stop talking</span><input type="checkbox" class="switch" id="autoSend" /></label>
           <label class="row"><span>Hands-free (keep listening after replies)</span><input type="checkbox" class="switch" id="handsFree" /></label>
           <div class="btn-row"><button id="voicePreview" class="pill">Preview voice</button></div>
+        </div>
+
+        <div class="card" id="freeCard" hidden>
+          <h3>Free AI</h3>
+          <div class="meter" aria-hidden="true"><span id="freeMeter"></span></div>
+          <p class="hint" id="freeInfo"></p>
         </div>
 
         <div class="card">

@@ -82,7 +82,16 @@ const name = () => S.settings?.therapistName || 'Dr. Mochi';
 
 // ---------- Screens ----------
 
-function showLogin(message = '') {
+// setup: the server has no access code yet (free Cloudflare version), so this screen creates one.
+let setupMode = false;
+function showLogin(message = '', { setup = false } = {}) {
+  setupMode = setup;
+  $('#loginHint').textContent = setup
+    ? "First, choose an access code (8+ characters). It keeps your chats private; you'll type it once on each device."
+    : 'Type your access code to unlock your chats.';
+  $('#loginBtn').textContent = setup ? 'Create code' : 'Unlock';
+  $('#codeInput').placeholder = setup ? 'New access code' : 'Access code';
+  $('#codeInput').autocomplete = setup ? 'new-password' : 'current-password';
   $('#boot').hidden = true;
   $('#chat').hidden = true;
   $('#login').hidden = false;
@@ -682,14 +691,14 @@ function wireComposer() {
 
 // ---------- Voice mode ----------
 
-const vm = { open: false, listening: false, ctl: null };
+const vm = { open: false, listening: false, transcribing: false, forceRecord: false, ctl: null };
 
 function setVoiceStatus(text) {
   $('#voiceStatus').textContent = text;
 }
 
 function openVoice() {
-  if (!voice.canListen) {
+  if (!hearingMode()) {
     toast("Talking isn't supported in this browser. Tap the 🎤 on your keyboard to dictate instead.", 5000);
     $('#input').focus();
     return;
@@ -716,12 +725,29 @@ function closeVoice() {
   setStatus(null);
 }
 
+// How we hear them: the browser's own speech recognition, or (free Cloudflare version) a recording that the
+// server transcribes. Recognition can be blocked inside iPhone Home Screen apps, so we switch if it fails.
+function hearingMode() {
+  if (voice.canListen && !vm.forceRecord) return 'speech';
+  if (S.server.transcribe && voice.canRecord) return 'record';
+  return null;
+}
+
+async function transcribe(wav) {
+  const res = await fetch('/api/transcribe', { method: 'POST', headers: { 'Content-Type': 'audio/wav' }, body: wav, credentials: 'same-origin' });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || "I couldn't make that out. Try again?");
+  return data.text || '';
+}
+
 function startListening() {
-  if (vm.listening || !vm.open) return;
+  if (vm.listening || vm.transcribing || !vm.open) return;
   if (S.streaming) {
     setVoiceStatus(`${name()} is typing…`);
     return;
   }
+  const mode = hearingMode();
+  if (!mode) return;
   voice.stopSpeaking();
   vm.listening = true;
   $('#voice').classList.add('listening');
@@ -729,43 +755,73 @@ function startListening() {
   setVoiceStatus('Listening…');
   face.state('listening');
   setStatus('listening…', true);
-  vm.ctl = voice.listen({
-    onText(text) {
+
+  const stopped = () => {
+    vm.listening = false;
+    $('#voice').classList.remove('listening');
+    face.state('idle');
+    setStatus(null);
+  };
+  const heard = (text) => {
+    if (!vm.open) return;
+    if (!text) {
+      setVoiceStatus('Tap the mic and talk to me');
+      return;
+    }
+    if (voice.voicePrefs.autoSend) {
       $('#voiceHeard').textContent = `“${text}”`;
-    },
-    onEnd(text) {
-      vm.listening = false;
-      $('#voice').classList.remove('listening');
-      face.state('idle');
-      setStatus(null);
-      if (!vm.open) return;
-      if (!text) {
-        setVoiceStatus('Tap the mic and talk to me');
-        return;
+      $('#voiceReply').textContent = '';
+      setVoiceStatus(`${name()} is thinking…`);
+      sendText(text);
+    } else {
+      const input = $('#input');
+      input.value = [input.value.trim(), text].filter(Boolean).join(' ');
+      autoGrow();
+      updateComposerButtons();
+      closeVoice();
+      input.focus();
+    }
+  };
+  const failed = (err) => {
+    stopped();
+    const blocked = err === 'not-allowed' || err === 'service-not-allowed' || err === 'network';
+    if (mode === 'speech' && blocked && S.server.transcribe && voice.canRecord) {
+      vm.forceRecord = true;
+      setVoiceStatus('Tap the mic again to talk');
+      return;
+    }
+    setVoiceStatus(
+      blocked || err === 'no-mic'
+        ? 'Microphone access is off. On iPhone: Settings › Privacy & Security › Microphone (and Speech Recognition).'
+        : 'Tap the mic and talk to me',
+    );
+  };
+
+  if (mode === 'speech') {
+    vm.ctl = voice.listen({
+      onText: (text) => ($('#voiceHeard').textContent = `“${text}”`),
+      onEnd: (text) => {
+        stopped();
+        heard(text);
+      },
+      onError: failed,
+    });
+    return;
+  }
+  vm.ctl = voice.record({
+    onError: failed,
+    onEnd: async (wav) => {
+      stopped();
+      if (!wav || !vm.open) return heard('');
+      vm.transcribing = true;
+      setVoiceStatus('Got it, writing that down…');
+      try {
+        heard(await transcribe(wav));
+      } catch (err) {
+        setVoiceStatus(err.message);
+      } finally {
+        vm.transcribing = false;
       }
-      if (voice.voicePrefs.autoSend) {
-        $('#voiceReply').textContent = '';
-        setVoiceStatus(`${name()} is thinking…`);
-        sendText(text);
-      } else {
-        const input = $('#input');
-        input.value = [input.value.trim(), text].filter(Boolean).join(' ');
-        autoGrow();
-        updateComposerButtons();
-        closeVoice();
-        input.focus();
-      }
-    },
-    onError(err) {
-      vm.listening = false;
-      $('#voice').classList.remove('listening');
-      face.state('idle');
-      setStatus(null);
-      setVoiceStatus(
-        err === 'not-allowed' || err === 'service-not-allowed'
-          ? 'Microphone or speech access is off. On iPhone: Settings › Privacy & Security › Microphone and Speech Recognition.'
-          : 'Tap the mic and talk to me',
-      );
     },
   });
 }
@@ -784,7 +840,7 @@ function wireVoice() {
   $('#voiceMain').addEventListener('click', () => {
     voice.unlockSpeech();
     if (vm.listening) vm.ctl?.stop();
-    else startListening();
+    else if (!vm.transcribing) startListening();
   });
   $('#vmReadAloud').addEventListener('change', (e) => {
     voice.voicePrefs.readAloud = e.target.checked;
@@ -855,7 +911,7 @@ function fillVoiceSettings() {
   sel.textContent = '';
   if (!voices.length) sel.append(new Option('Default voice', ''));
   for (const v of voices) sel.append(new Option(`${v.name} (${v.lang})`, v.voiceURI, false, v.voiceURI === p.voiceURI));
-  $('#voiceSupport').textContent = voice.canListen
+  $('#voiceSupport').textContent = hearingMode()
     ? 'Tap the mic next to the text box (or the face up top) to talk out loud. Replies show up as texts.'
     : "Talking out loud isn't supported in this browser. You can still use the dictation mic on your keyboard.";
 }
@@ -886,12 +942,39 @@ function fillSettings() {
   $('#memory').value = S.memory.text || '';
   renderCheckinInfo();
   fillVoiceSettings();
+  renderFreeUsage();
+}
+
+// Free Cloudflare version: how much of today's free AI allowance is used.
+function renderFreeUsage() {
+  const card = $('#freeCard');
+  const u = S.server.usage;
+  card.hidden = S.server.provider !== 'workers-ai' || !u;
+  if (card.hidden) return;
+  const pct = Math.min(100, Math.round((u.neurons / u.limit) * 100));
+  const reset = new Date(Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth(), new Date().getUTCDate() + 1));
+  $('#freeMeter').style.width = `${pct}%`;
+  $('#freeInfo').textContent =
+    `Running on Cloudflare's free AI (${S.server.modelLabel || S.server.model}). ` +
+    `Today you've used about ${pct}% of the free daily allowance (roughly ${Math.max(0, Math.floor((u.limit - u.neurons) / 35))} more texts). ` +
+    `It resets at ${fmtTime(reset.getTime())}.`;
+}
+
+async function refreshFreeUsage() {
+  if (S.server.provider !== 'workers-ai') return;
+  try {
+    S.server.usage = await api('/usage');
+    renderFreeUsage();
+  } catch {
+    // not critical
+  }
 }
 
 function wireSettings() {
   $('#settingsBtn').addEventListener('click', () => {
     fillSettings();
     refreshNotifUI();
+    refreshFreeUsage();
     $('#settings').hidden = false;
   });
   $('#helpBtn').addEventListener('click', () => ($('#help').hidden = false));
@@ -1161,7 +1244,7 @@ function wireLogin() {
     const code = $('#codeInput').value;
     $('#loginError').textContent = '';
     try {
-      await api('/login', { method: 'POST', body: { code } });
+      await api(setupMode ? '/setup' : '/login', { method: 'POST', body: { code } });
       $('#codeInput').value = '';
       await loadState();
       showChat();
@@ -1201,7 +1284,7 @@ async function boot() {
     const me = await api('/me');
     if (!me.authed) {
       for (const n of $$('[data-tname]')) n.textContent = me.name;
-      return showLogin();
+      return showLogin('', { setup: Boolean(me.setup) });
     }
     await loadState();
     showChat();

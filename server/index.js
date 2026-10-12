@@ -1,6 +1,7 @@
 import express from 'express';
 import multer from 'multer';
 import QRCode from 'qrcode';
+import fs from 'node:fs';
 import path from 'node:path';
 import { config } from './config.js';
 import { state, save, flush, addMessage, publicMessage } from './store.js';
@@ -10,7 +11,7 @@ import { saveUpload, UploadError, attachmentPath, deleteAllAttachments } from '.
 import { generateReply, maybeUpdateMemory, friendlyMessage } from './ai.js';
 import { vapidPublicKey, addSubscription, removeSubscription, notifyAll, notifyMessage } from './push.js';
 import { startScheduler, reschedule, noteUserActivity, sendCheckinNow } from './scheduler.js';
-import { buildMobileConfig, defaultIconPath } from './profile.js';
+import { buildMobileConfig } from './profile.js';
 import { withLock } from './lock.js';
 import { parseReply, plainText } from '../public/js/reply-format.js';
 
@@ -53,7 +54,8 @@ app.get('/api/me', (req, res) => res.json({ authed: isAuthed(req), name: state.s
 app.get(['/app.mobileconfig', '/install.mobileconfig'], (req, res) => {
   const base = config.publicUrl || `${req.protocol}://${req.get('host')}`;
   const label = state.settings.therapistName;
-  const body = buildMobileConfig({ url: base, label, iconPath: defaultIconPath(config.publicDir) });
+  const iconBase64 = fs.readFileSync(path.join(config.publicDir, 'icons', 'apple-touch-icon.png')).toString('base64');
+  const body = buildMobileConfig({ url: base, label, iconBase64 });
   const filename = label.replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-|-$/g, '') || 'therapist';
   res.setHeader('Content-Type', 'application/x-apple-aspen-config');
   res.setHeader('Content-Disposition', `attachment; filename="${filename}.mobileconfig"`);
@@ -93,6 +95,9 @@ app.get('/manifest.webmanifest', (req, res) => {
     ],
   });
 });
+
+// public/_headers is Cloudflare's header config for the free version; nothing to serve here.
+app.get('/_headers', (req, res) => res.status(404).end());
 
 app.use(
   express.static(config.publicDir, {
@@ -227,9 +232,9 @@ api.post('/chat', async (req, res) => {
         return;
       }
       send('typing', {});
-      const { raw, reset } = await generateReply({ onDelta: (t) => send('delta', { t }) });
+      const { raw, reset, risk } = await generateReply({ onDelta: (t) => send('delta', { t }) });
       const parsed = parseReply(raw);
-      const reply = addMessage({ role: 'assistant', text: raw, mood: parsed.mood, crisis: parsed.crisis });
+      const reply = addMessage({ role: 'assistant', text: raw, mood: parsed.mood, crisis: parsed.crisis || risk });
       send('done', { message: publicMessage(reply), reset: Boolean(reset) });
       // They closed the app before the reply finished: text them like a normal messaging app would.
       if (!open && state.settings.checkins.replyNotifications) notifyMessage(raw, 'reply').catch(() => {});

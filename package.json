@@ -2,7 +2,7 @@
   "name": "mochi-therapy-texting",
   "version": "1.0.0",
   "private": true,
-  "description": "Text with Dr. Mochi, a cartoon AI therapist. Installable on iPhone via a configuration profile.",
+  "description": "Text with Dr. Mochi, a cartoon AI therapist. Runs free on Cloudflare (Workers AI) or on Node with Claude. Installable on iPhone via a configuration profile.",
   "type": "module",
   "main": "server/index.js",
   "scripts": {
@@ -11,7 +11,9 @@
     "demo": "MOCK_AI=1 ACCESS_CODE=demo node server/index.js",
     "icons": "node scripts/make-icons.mjs",
     "profile": "node scripts/make-profile.mjs",
-    "test": "node --test"
+    "test": "node --test",
+    "cf:demo": "wrangler dev -c test/wrangler.test.jsonc --var MOCK_AI:1",
+    "cf:deploy": "wrangler deploy"
   },
   "engines": {
     "node": ">=20.12"
@@ -23,5 +25,9 @@
     "multer": "^2.0.2",
     "qrcode": "^1.5.4",
     "web-push": "^3.6.7"
+  },
+  "devDependencies": {
+    "http_ece": "^1.2.1",
+    "wrangler": "^4.149.0"
   }
 }

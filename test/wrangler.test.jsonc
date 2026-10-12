@@ -1,0 +1,14 @@
+// Local test config: same Worker without the Workers AI binding (which needs a Cloudflare account).
+// Run: npx wrangler dev -c test/wrangler.test.jsonc --var MOCK_AI:1 --var ACCESS_CODE:demo
+{
+  "name": "dr-mochi-test",
+  "main": "../worker/index.js",
+  "compatibility_date": "2026-10-01",
+  "assets": {
+    "directory": "../public",
+    "binding": "ASSETS",
+    "run_worker_first": ["/api/*", "/app.mobileconfig", "/install.mobileconfig", "/install-qr.svg", "/manifest.webmanifest"]
+  },
+  "d1_databases": [{ "binding": "DB", "database_name": "dr-mochi-test", "database_id": "00000000-0000-0000-0000-000000000000" }],
+  "triggers": { "crons": ["*/5 * * * *"] }
+}

@@ -4,7 +4,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { buildMobileConfig, defaultIconPath } from '../server/profile.js';
+import { buildMobileConfig } from '../server/profile.js';
 
 const [url, label = 'Dr. Mochi'] = process.argv.slice(2);
 if (!url || !/^https?:\/\//.test(url)) {
@@ -13,5 +13,6 @@ if (!url || !/^https?:\/\//.test(url)) {
 }
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const file = `${label.replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-|-$/g, '') || 'therapist'}.mobileconfig`;
-fs.writeFileSync(file, buildMobileConfig({ url, label, iconPath: defaultIconPath(path.join(root, 'public')) }));
+const iconBase64 = fs.readFileSync(path.join(root, 'public', 'icons', 'apple-touch-icon.png')).toString('base64');
+fs.writeFileSync(file, buildMobileConfig({ url, label, iconBase64 }));
 console.log(`Wrote ${file}. AirDrop or email it to your iPhone, open it, then install it from Settings.`);

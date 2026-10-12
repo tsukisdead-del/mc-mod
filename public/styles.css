@@ -1444,3 +1444,20 @@ a {
 .settled .att-images img {
   animation: none;
 }
+
+/* Free plan usage meter */
+.meter {
+  height: 10px;
+  border-radius: 999px;
+  background: var(--line);
+  overflow: hidden;
+  margin: 8px 0 6px;
+}
+.meter span {
+  display: block;
+  height: 100%;
+  width: 0;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #8fd3c1, var(--accent));
+  transition: width 0.4s;
+}

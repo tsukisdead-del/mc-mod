@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseReply, plainText } from '../public/js/reply-format.js';
@@ -77,15 +78,16 @@ test('tone bands cover the whole slider', () => {
 });
 
 test('the iPhone profile is a web clip pointing at the app', () => {
+  const icon = fs.readFileSync(path.join(root, 'public/icons/apple-touch-icon.png')).toString('base64');
   const xml = buildMobileConfig({
     url: 'https://mochi.example.com',
     label: 'Dr. <Mochi>',
-    iconPath: path.join(root, 'public/icons/apple-touch-icon.png'),
+    iconBase64: icon,
   });
   assert.match(xml, /<string>com\.apple\.webClip\.managed<\/string>/);
   assert.match(xml, /<string>https:\/\/mochi\.example\.com\/<\/string>/);
   assert.match(xml, /Dr\. &lt;Mochi&gt;/);
   assert.match(xml, /<key>FullScreen<\/key>\s*<true\/>/);
   // Same URL, same UUIDs: reinstalling replaces instead of duplicating.
-  assert.equal(xml, buildMobileConfig({ url: 'https://mochi.example.com/', label: 'Dr. <Mochi>', iconPath: path.join(root, 'public/icons/apple-touch-icon.png') }));
+  assert.equal(xml, buildMobileConfig({ url: 'https://mochi.example.com/', label: 'Dr. <Mochi>', iconBase64: icon }));
 });
