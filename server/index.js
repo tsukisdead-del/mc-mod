@@ -4,7 +4,7 @@ import QRCode from 'qrcode';
 import fs from 'node:fs';
 import path from 'node:path';
 import { config } from './config.js';
-import { state, save, flush, addMessage, publicMessage } from './store.js';
+import { state, save, flush, addMessage, publicMessage, newId, UPLOAD_DIR } from './store.js';
 import { requireAuth, login, logout, isAuthed } from './auth.js';
 import { applySettingsPatch, FREQUENCIES } from './settings.js';
 import { saveUpload, UploadError, attachmentPath, deleteAllAttachments } from './attachments.js';
@@ -145,6 +145,7 @@ api.get('/state', (req, res) => {
       hasApiKey: config.hasApiKey || config.mockAI,
       // Local models work faster with smaller photos.
       photoMaxSide: config.aiProvider === 'ollama' ? 1024 : undefined,
+      maxUploadMB: MAX_UPLOAD_MB,
       ...providerInfo(),
     },
   });
@@ -177,13 +178,18 @@ api.put('/settings', (req, res) => {
   res.json({ settings: state.settings, checkin: checkinStatus() });
 });
 
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: config.maxUploadBytes, files: 1 } });
+// Straight to disk: a 50 MB book would otherwise be held in memory two or three times over.
+const upload = multer({
+  storage: multer.diskStorage({ destination: UPLOAD_DIR, filename: (req, file, cb) => cb(null, `upload-${newId()}.tmp`) }),
+  limits: { fileSize: config.maxUploadBytes, files: 1 },
+});
+const MAX_UPLOAD_MB = Math.round(config.maxUploadBytes / 1024 / 1024);
 
 api.post('/upload', (req, res) => {
   upload.single('file')(req, res, async (err) => {
     if (err) {
       const tooBig = err.code === 'LIMIT_FILE_SIZE';
-      return res.status(400).json({ error: tooBig ? 'That file is over 20 MB. Try a smaller one.' : 'Upload failed. Try again?' });
+      return res.status(400).json({ error: tooBig ? `That file is over ${MAX_UPLOAD_MB} MB. Try a smaller one.` : 'Upload failed. Try again?' });
     }
     if (!req.file) return res.status(400).json({ error: 'No file received.' });
     try {
@@ -204,7 +210,7 @@ api.get('/attachments/:id', (req, res) => {
   res.setHeader('Cache-Control', 'private, no-cache');
   res.setHeader('ETag', etag);
   if (req.headers['if-none-match'] === etag) return res.status(304).end();
-  res.setHeader('Content-Type', meta.mime);
+  res.setHeader('Content-Type', meta.mime === 'text/plain' ? 'text/plain; charset=utf-8' : meta.mime);
   res.setHeader('Content-Security-Policy', 'sandbox');
   res.setHeader('Content-Disposition', `inline; filename*=UTF-8''${encodeURIComponent(meta.name)}`);
   res.sendFile(attachmentPath(meta));
@@ -379,6 +385,9 @@ async function checkOllama() {
     );
   }
 }
+
+// Uploads cut off by a restart leave a temporary file behind.
+for (const f of fs.readdirSync(UPLOAD_DIR)) if (/^upload-.*\.tmp$/.test(f)) fs.rmSync(path.join(UPLOAD_DIR, f), { force: true });
 
 startScheduler();
 

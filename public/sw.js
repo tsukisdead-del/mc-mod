@@ -1,5 +1,5 @@
 // Service worker: offline app shell, push notifications (check-ins), and the app badge.
-const CACHE = 'mochi-shell-v2';
+const CACHE = 'mochi-shell-v3';
 const SHELL = [
   '/',
   '/styles.css',
@@ -9,6 +9,7 @@ const SHELL = [
   '/js/markdown.js',
   '/js/voice.js',
   '/js/reply-format.js',
+  '/js/transcript.js',
   '/icons/icon-192.png',
   '/icons/apple-touch-icon.png',
 ];

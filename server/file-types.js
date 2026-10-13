@@ -2,7 +2,8 @@
 
 const IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
 const TEXT_EXTS = new Set(['.txt', '.md', '.markdown', '.csv', '.tsv', '.json', '.log', '.text', '.html', '.htm', '.xml', '.yaml', '.yml', '.rtf']);
-export const MAX_TEXT_CHARS = 400_000;
+// Longest document text kept (about 4,000 pages). The Cloudflare version allows less (see worker/files.js).
+export const MAX_TEXT_CHARS = 10_000_000;
 export const DOCX_MIME = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
 
 export class UploadError extends Error {}
@@ -38,11 +39,12 @@ export function cleanName(name) {
 }
 
 // Validates extracted document text.
-export function checkText(text) {
+export function checkText(text, maxChars = MAX_TEXT_CHARS) {
   const clean = String(text || '').replace(/\u0000/g, '');
   if (!clean.trim()) throw new UploadError('That file looks empty.');
-  if (clean.length > MAX_TEXT_CHARS) {
-    throw new UploadError('That file is too long for me to read in one go. Try sending the part you want me to look at.');
+  if (clean.length > maxChars) {
+    const pages = Math.round(maxChars / 2500 / 100) * 100;
+    throw new UploadError(`That document is too long for me (I can take about ${pages.toLocaleString('en-US')} pages). Try sending the part you want me to look at.`);
   }
   return clean;
 }

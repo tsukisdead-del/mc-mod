@@ -1,8 +1,9 @@
-import { api, streamChat, AuthError } from './api.js';
+import { api, streamChat, uploadFile, AuthError } from './api.js';
 import { mountAvatar, face } from './avatar.js';
 import { renderMarkdown } from './markdown.js';
 import { parseReply, plainText } from './reply-format.js';
 import * as voice from './voice.js';
+import { fixName } from './transcript.js';
 
 const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
@@ -590,12 +591,15 @@ async function addPending(file) {
       ({ blob, name: fileName } = await shrinkImage(file));
       p.previewUrl = URL.createObjectURL(blob);
       renderPending();
-    } else if (file.size > 20 * 1024 * 1024) {
-      throw new Error('That file is over 20 MB.');
+    } else if (file.size > (S.server.maxUploadMB || 20) * 1024 * 1024) {
+      throw new Error(`That file is over ${S.server.maxUploadMB || 20} MB.`);
     }
     const form = new FormData();
     form.append('file', blob, fileName);
-    const { attachment } = await api('/upload', { method: 'POST', form });
+    const { attachment } = await uploadFile(form, (sent) => {
+      p.progress = sent;
+      showProgress(p);
+    });
     p.attachment = attachment;
     p.status = 'ready';
   } catch (err) {
@@ -604,6 +608,12 @@ async function addPending(file) {
     S.pending = S.pending.filter((x) => x !== p);
   }
   renderPending();
+}
+
+// "45%" while a file is being sent, then "Reading…" while the server opens it (long documents take a moment).
+function showProgress(p) {
+  if (!p.statusEl) return;
+  p.statusEl.textContent = p.status !== 'uploading' || p.progress === undefined ? '' : p.progress >= 1 ? 'Reading…' : `${Math.round(p.progress * 100)}%`;
 }
 
 function renderPending() {
@@ -622,6 +632,9 @@ function renderPending() {
       d.append(document.createTextNode(p.name));
       item.append(d);
     }
+    p.statusEl = el('span', 'p-status');
+    showProgress(p);
+    item.append(p.statusEl);
     const x = el('button', 'p-remove', '×');
     x.setAttribute('aria-label', `Remove ${p.name}`);
     x.addEventListener('click', () => {
@@ -780,8 +793,9 @@ function startListening() {
     face.state('idle');
     setStatus(null);
   };
-  const heard = (text) => {
+  const heard = (said) => {
     if (!vm.open) return;
+    const text = fixName(said || '', name());
     if (!text) {
       setVoiceStatus('Tap the mic and talk to me');
       return;

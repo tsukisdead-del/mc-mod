@@ -45,3 +45,27 @@ export async function streamChat(items, handlers) {
     }
   }
 }
+
+// Uploads a file and reports how much has been sent (0 to 1). Big documents take a while, so the app shows it.
+export function uploadFile(form, onProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', '/api/upload');
+    xhr.withCredentials = true;
+    xhr.upload.onprogress = (e) => e.lengthComputable && onProgress?.(e.loaded / e.total);
+    xhr.upload.onload = () => onProgress?.(1);
+    xhr.onload = () => {
+      if (xhr.status === 401) return reject(new AuthError('Please unlock the app again.'));
+      let data = {};
+      try {
+        data = JSON.parse(xhr.responseText);
+      } catch {
+        // not JSON (e.g. a proxy error page)
+      }
+      if (xhr.status >= 200 && xhr.status < 300) resolve(data);
+      else reject(Object.assign(new Error(data.error || (xhr.status === 413 ? 'That file is too big to send.' : `Upload failed (${xhr.status})`)), { status: xhr.status }));
+    };
+    xhr.onerror = () => reject(new Error("Couldn't upload that. Check your connection and try again."));
+    xhr.send(form);
+  });
+}

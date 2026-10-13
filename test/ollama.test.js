@@ -41,6 +41,14 @@ const ollama = http.createServer((req, res) => {
 let mods;
 const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mochi-ollama-'));
 
+// What multer's disk storage hands the upload route: the file is already in the uploads folder.
+let uploads = 0;
+function upload(originalname, mimetype, buffer) {
+  const p = path.join(dataDir, 'uploads', `upload-test${++uploads}.tmp`);
+  fs.writeFileSync(p, buffer);
+  return mods.files.saveUpload({ originalname, mimetype, size: buffer.length, path: p });
+}
+
 before(async () => {
   await new Promise((r) => ollama.listen(0, r));
   delete process.env.ANTHROPIC_API_KEY;
@@ -69,7 +77,7 @@ test('without a Claude key it uses Ollama', () => {
 
 test('replies stream from Ollama with the photo, the safety note and thinking off', async () => {
   const { store, ai, files } = mods;
-  const photo = await files.saveUpload({ originalname: 'room.jpg', mimetype: 'image/jpeg', size: 4, buffer: Buffer.from([1, 2, 3, 4]) });
+  const photo = await upload('room.jpg', 'image/jpeg', Buffer.from([1, 2, 3, 4]));
   store.addMessage({ role: 'user', text: 'hi' });
   store.addMessage({ role: 'assistant', text: '[[mood:warm]] hey!' });
   store.addMessage({ role: 'user', text: 'honestly I want to die', attachments: [photo.id] });
@@ -120,16 +128,14 @@ test('PDFs are read as text; scans are turned away', async () => {
   const { files } = mods;
   const pdf =
     '%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 300 144]/Contents 4 0 R/Resources<</Font<</F1 5 0 R>>>>>>endobj\n4 0 obj<</Length 55>>stream\nBT /F1 18 Tf 20 100 Td (I felt anxious before my exam.) Tj ET\nendstream endobj\n5 0 obj<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>endobj\ntrailer<</Root 1 0 R>>\n%%EOF';
-  const meta = await files.saveUpload({ originalname: 'journal.pdf', mimetype: 'application/pdf', size: pdf.length, buffer: Buffer.from(pdf) });
-  assert.equal(await files.pdfText(meta), 'I felt anxious before my exam.');
-  const parts = await files.openModelParts([meta.id], { fresh: new Set(), vision: true, maxChars: 1000 });
-  assert.match(parts[0].text, /journal\.pdf[\s\S]*anxious before my exam/);
+  const meta = await upload('journal.pdf', 'application/pdf', Buffer.from(pdf));
+  assert.equal(meta.pages, 1);
+  assert.equal(fs.readFileSync(path.join(dataDir, 'uploads', meta.textFile), 'utf8').trim(), 'I felt anxious before my exam.');
 
   const blank = pdf.replace('(I felt anxious before my exam.) Tj', '');
-  await assert.rejects(
-    files.saveUpload({ originalname: 'scan.pdf', mimetype: 'application/pdf', size: blank.length, buffer: Buffer.from(blank) }),
-    /couldn't find any text/,
-  );
+  await assert.rejects(upload('scan.pdf', 'application/pdf', Buffer.from(blank)), /couldn't find any text/);
+  // nothing is left behind in the uploads folder
+  assert.ok(!fs.readdirSync(path.join(dataDir, 'uploads')).some((f) => f.startsWith('upload-')));
 });
 
 test('when Ollama is closed: a clear message, and check-ins still go out', async () => {
@@ -155,4 +161,68 @@ test('when Ollama is closed: a clear message, and check-ins still go out', async
   ollamaError = 'something odd';
   await assert.rejects(ai.generateReply({ onDelta: () => {} }), (err) => /Ollama had a problem \(500\): something odd/.test(ai.friendlyMessage(err)));
   ollamaError = null;
+});
+
+// A simple many-page PDF (one line of text per page).
+function makePdf(lines) {
+  const objs = ['<</Type/Catalog/Pages 2 0 R>>', `<</Type/Pages/Kids[${lines.map((_, i) => `${3 + i * 2} 0 R`).join(' ')}]/Count ${lines.length}>>`];
+  lines.forEach((line, i) => {
+    // wrap into lines that fit the page width
+    const rows = line.match(/.{1,80}(\s|$)/g) || [''];
+    const stream = `BT /F1 10 Tf 20 760 Td 12 TL ${rows.map((r) => `(${r.trim()}) Tj T*`).join(' ')} ET`;
+    objs.push(`<</Type/Page/Parent 2 0 R/MediaBox[0 0 600 792]/Contents ${4 + i * 2} 0 R/Resources<</Font<</F1 ${3 + lines.length * 2} 0 R>>>>>>`);
+    objs.push(`<</Length ${stream.length}>>stream\n${stream}\nendstream`);
+  });
+  objs.push('<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>');
+  return Buffer.from(`%PDF-1.4\n${objs.map((o, i) => `${i + 1} 0 obj${o}endobj`).join('\n')}\ntrailer<</Root 1 0 R>>\n%%EOF`);
+}
+
+test('a long document: the local model gets its opening and the part they ask about, within its window', async () => {
+  const { store, ai } = mods;
+  const paragraphs = Array.from({ length: 1500 }, (_, i) =>
+    i === 1200 ? 'In the winter of that year Eleanor finally called her father and they talked for hours.' : `Paragraph ${i}: an ordinary day at the office, nothing to report.`,
+  );
+  const book = await upload('memoir.txt', 'text/plain', Buffer.from(paragraphs.join('\n\n')));
+  assert.ok(book.chars > 90000);
+  store.addMessage({ role: 'user', text: 'what happened when Eleanor called her father?', attachments: [book.id] });
+  await ai.generateReply({ onDelta: () => {} });
+  const req = requests.at(-1);
+  const all = JSON.stringify(req.messages);
+  assert.match(all, /Long document they sent: \\"memoir.txt\\"/);
+  assert.match(req.messages.at(-1).content, /Eleanor finally called her father/);
+  // Everything sent stays well inside the 16k-token window.
+  assert.ok(all.length < 40000, `sent ${all.length} chars`);
+});
+
+test('a long PDF: matching pages are found and labelled with their page numbers', async () => {
+  const { store, ai } = mods;
+  const filler = 'Quarterly budgets, spreadsheets, invoices and meeting notes. '.repeat(8);
+  const pages = Array.from({ length: 60 }, (_, i) =>
+    i === 41 ? `The therapist said the panic attacks were her body trying to protect her. ${filler}` : `Page ${i + 1}. ${filler}`,
+  );
+  const pdf = await upload('notes.pdf', 'application/pdf', makePdf(pages));
+  assert.equal(pdf.pages, 60);
+  store.addMessage({ role: 'assistant', text: '[[mood:warm]] got it' });
+  store.addMessage({ role: 'user', text: 'what did the therapist say about the panic attacks?', attachments: [pdf.id] });
+  await ai.generateReply({ onDelta: () => {} });
+  const last = requests.at(-1).messages.at(-1).content;
+  const hit = last.match(/--- pages? (\d+)(?:–(\d+))? ---\n(?:(?!---)[\s\S])*panic attacks were her body trying to protect her/);
+  assert.ok(hit, 'the matching page is included');
+  assert.ok(Number(hit[1]) <= 42 && 42 <= Number(hit[2] || hit[1]), `labelled ${hit[0].split('\n')[0]}`);
+  // an older document nobody asked about adds nothing
+  assert.doesNotMatch(last, /memoir/);
+});
+
+test('with Claude, a small PDF goes as itself and a long one as text', async () => {
+  const { files, store } = mods;
+  const small = await upload('one-page.pdf', 'application/pdf', makePdf(['A short letter to my younger self.']));
+  const big = await upload('book.pdf', 'application/pdf', makePdf(Array.from({ length: 150 }, (_, i) => `Chapter line ${i} with plenty of words to read.`)));
+  const msg = store.addMessage({ role: 'user', text: 'two pdfs', attachments: [small.id, big.id] });
+  const turns = [{ role: 'user', content: [{ type: 'files', ids: [small.id, big.id] }] }];
+  const f = await files.prepareFiles({ turns, messages: [msg], fresh: new Set([small.id, big.id]), query: '', budget: { inlineFresh: 100000, inlineOlder: 100000, excerpts: 20000, overview: 1500, maxParts: 30 }, claude: true });
+  const blocks = await files.claudeParts([small.id, big.id], f);
+  assert.equal(blocks[0].type, 'document');
+  assert.equal(blocks[0].source.media_type, 'application/pdf');
+  assert.equal(blocks[1].type, 'text');
+  assert.match(blocks[1].text, /Document they sent: "book.pdf"[\s\S]*Chapter line 149/);
 });

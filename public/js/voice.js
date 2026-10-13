@@ -1,7 +1,13 @@
 // Talking to Mochi: speech-to-text with the browser's Web Speech API (works in Safari on iPhone)
 // and optional read-aloud with speechSynthesis. Voice preferences are per-device (localStorage).
 
+import { assemble } from './transcript.js';
+
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+// Safari (every browser on iPhone) repeats pieces of what it heard in continuous mode; there, listen for one
+// stretch of speech at a time instead. It still stops at a natural pause.
+const ua = navigator.userAgent;
+const APPLE_WEBKIT = /iPad|iPhone|iPod/.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1) || (/Safari/.test(ua) && !/Chrome|Chromium|Android|Edg\//.test(ua));
 const synth = window.speechSynthesis;
 
 const PREFS_KEY = 'mochi.voice';
@@ -44,7 +50,7 @@ export function listen({ onText, onEnd, onError, silenceMs = 1800 }) {
   const rec = new SR();
   rec.lang = navigator.language || 'en-US';
   rec.interimResults = true;
-  rec.continuous = true;
+  rec.continuous = !APPLE_WEBKIT;
   rec.maxAlternatives = 1;
 
   let text = '';
@@ -58,15 +64,8 @@ export function listen({ onText, onEnd, onError, silenceMs = 1800 }) {
   };
 
   rec.onresult = (event) => {
-    // Rebuild the whole transcript each time; works the same in continuous and single-shot modes.
-    let finalText = '';
-    let interim = '';
-    for (let i = 0; i < event.results.length; i++) {
-      const r = event.results[i];
-      if (r.isFinal) finalText += r[0].transcript;
-      else interim += r[0].transcript;
-    }
-    text = (finalText + interim).replace(/\s+/g, ' ').trim();
+    // Rebuild the whole transcript each time, merging the pieces that browsers send twice.
+    text = assemble(event.results);
     onText?.(text);
     armSilence();
   };

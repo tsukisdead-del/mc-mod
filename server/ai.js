@@ -2,19 +2,17 @@ import Anthropic from '@anthropic-ai/sdk';
 import { config } from './config.js';
 import { state, save } from './store.js';
 import { PERSONA, settingsBlock, checkinInstruction, MEMORY_INSTRUCTIONS } from './prompts.js';
-import { attachmentBlocks, attachmentPlaceholder, openModelParts } from './attachments.js';
-import { buildTurns, resolveFiles, appendUserNote, transcript, nextHistoryStart, MEMORY_EVERY } from './history.js';
+import { attachmentPlaceholder, prepareFiles, claudeParts, localParts } from './attachments.js';
+import { buildTurns, resolveFiles, appendUserNote, transcript, nextHistoryStart, MEMORY_EVERY, RECENT_FILE_MESSAGES } from './history.js';
+import { DOC_BUDGETS, scaleBudget, searchTextFor } from './doc-search.js';
 import { looksLikeCrisis, CRISIS_NOTE } from './safety.js';
 import { mockReplyText, mockCheckinText, mockMemoryText, streamMock } from './mock.js';
 import { FORMAT_REMINDER, simpleCheckin, toOllamaMessages, readNdjson } from './open-models.js';
 
 // The local model (Ollama) gets a shorter verbatim history (the memory notes carry the rest), photos only on
-// the turn they're sent, and trimmed documents, so everything fits in its context window.
+// the turn they're sent, and a smaller document budget (doc-search.js), so everything fits its context window.
 const LOCAL_WINDOW = { max: 40, keep: 20 };
 const LOCAL_DOC_TURNS = 6;
-// Document characters per request (about 4 per token), shared by the documents being sent: the new ones get
-// most of it, older ones a reminder-sized share.
-const LOCAL_DOC_CHARS = { fresh: 24000, older: 6000 };
 const OLLAMA_DOWN =
   "I can't reach Ollama, the free AI that runs on this computer. Open the Ollama app (or run `ollama serve`) and try again. (Or add an ANTHROPIC_API_KEY to use Claude instead.)";
 
@@ -132,25 +130,22 @@ function localSystem() {
   return `${PERSONA}\n\n${settingsBlock(state.settings, state.memory.text)}\n\n${FORMAT_REMINDER}`;
 }
 
-async function localHistory() {
+// The conversation for the model, with files: photos, documents whole when short, and for long documents
+// their opening plus the parts that match what they just said (search: replies do, check-ins don't).
+async function conversation({ claude, search }) {
+  const messages = state.messages.filter((m) => m.createdAt >= state.historyStart);
   const fresh = new Set(unansweredUserMessages().flatMap((m) => m.attachments || []));
-  const turns = buildTurns(
-    state.messages.filter((m) => m.createdAt >= state.historyStart),
-    {
-      timezone: state.settings.timezone,
-      filePlaceholder: attachmentPlaceholder,
-      recentFiles: LOCAL_DOC_TURNS,
-    },
-  );
-  // Share the document budget so several long files together still fit the model's context window.
-  const docs = turns
-    .flatMap((t) => t.content.filter((p) => p.type === 'files').flatMap((p) => p.ids))
-    .filter((id) => state.attachments[id] && state.attachments[id].kind !== 'image');
-  const freshDocs = docs.filter((id) => fresh.has(id)).length;
-  const olderDocs = docs.length - freshDocs;
-  const maxChars = (id) =>
-    Math.floor(fresh.has(id) ? LOCAL_DOC_CHARS.fresh / Math.max(freshDocs, 1) : LOCAL_DOC_CHARS.older / Math.max(olderDocs, 1));
-  return resolveFiles(turns, (ids) => openModelParts(ids, { fresh, vision: config.ollamaVision, maxChars }));
+  const turns = buildTurns(messages, {
+    timezone: state.settings.timezone,
+    filePlaceholder: attachmentPlaceholder,
+    recentFiles: claude ? RECENT_FILE_MESSAGES : LOCAL_DOC_TURNS,
+  });
+  const budget = claude ? DOC_BUDGETS.claude : scaleBudget(DOC_BUDGETS.local, config.ollamaNumCtx / 16384);
+  const files = await prepareFiles({ turns, messages, fresh, query: search ? searchTextFor(messages) : '', budget, claude });
+  await resolveFiles(turns, (ids) => (claude ? claudeParts(ids, files) : localParts(ids, files, { vision: config.ollamaVision })));
+  // Matching parts go with their newest message, so earlier turns stay the same (and cached, for Claude).
+  if (files.excerpts.length && turns.at(-1)?.role === 'user') appendUserNote(turns, files.excerpts.join('\n\n'));
+  return turns;
 }
 
 // ---------- Claude ----------
@@ -196,18 +191,6 @@ function textOf(message) {
     .trim();
 }
 
-// Stored messages -> Messages API turns. Deterministic, so the prompt cache keeps hitting.
-async function buildHistory() {
-  const turns = buildTurns(
-    state.messages.filter((m) => m.createdAt >= state.historyStart),
-    {
-      timezone: state.settings.timezone,
-      filePlaceholder: attachmentPlaceholder,
-    },
-  );
-  return resolveFiles(turns, attachmentBlocks);
-}
-
 // ---------- Chat replies ----------
 
 // Their messages since your last reply.
@@ -232,13 +215,13 @@ export async function generateReply({ onDelta }) {
     return { raw, risk };
   }
   if (config.aiProvider === 'ollama') {
-    const turns = await localHistory();
+    const turns = await conversation({ claude: false, search: true });
     if (turns.at(-1)?.role !== 'user') throw new FriendlyError('There is nothing new to reply to.');
     if (risk) appendUserNote(turns, CRISIS_NOTE);
     const { text } = await ollamaChat(toOllamaMessages(localSystem(), turns), { onText: onDelta, maxTokens: 700 });
     return { raw: text || EMPTY_REPLY, risk };
   }
-  const messages = await buildHistory();
+  const messages = await conversation({ claude: true, search: true });
   if (messages.at(-1)?.role !== 'user') throw new FriendlyError('There is nothing new to reply to.');
   if (risk) appendUserNote(messages, CRISIS_NOTE);
 
@@ -265,7 +248,7 @@ export async function generateCheckin() {
   if (config.mockAI) return mockCheckinText();
   if (config.aiProvider === 'ollama') {
     try {
-      const turns = appendUserNote(await localHistory(), instruction);
+      const turns = appendUserNote(await conversation({ claude: false, search: false }), instruction);
       return (await ollamaChat(toOllamaMessages(localSystem(), turns), { maxTokens: 300 })).text || null;
     } catch (err) {
       // Ollama is closed or busy: still check in, with a simple message.
@@ -274,7 +257,7 @@ export async function generateCheckin() {
     }
   }
 
-  const messages = appendUserNote(await buildHistory(), instruction);
+  const messages = appendUserNote(await conversation({ claude: true, search: false }), instruction);
 
   const stream = getClient().beta.messages.stream(requestParams({ messages, effort: 'low', maxTokens: 16000 }));
   const final = await stream.finalMessage();

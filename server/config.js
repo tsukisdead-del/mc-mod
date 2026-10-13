@@ -39,5 +39,6 @@ export const config = {
   vapidSubject: (process.env.VAPID_SUBJECT || '').trim(),
   vapidPublicKey: (process.env.VAPID_PUBLIC_KEY || '').trim(),
   vapidPrivateKey: (process.env.VAPID_PRIVATE_KEY || '').trim(),
-  maxUploadBytes: 20 * 1024 * 1024,
+  // Under 100 MB, the most a Cloudflare tunnel passes through.
+  maxUploadBytes: 50 * 1024 * 1024,
 };

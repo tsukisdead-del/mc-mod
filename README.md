@@ -10,7 +10,7 @@ A private texting app where you talk to **Dr. Mochi**, a cartoon AI therapist. Y
 
 - **Texting.** Replies stream in like someone typing and come as separate texts. The cartoon's face reacts to what it's saying: warm, laughing, thinking, concerned, proud, or curious.
 - **Talking.** Tap the mic (or the face at the top) to talk out loud. Your words go in as texts and Dr. Mochi texts back. It can also read its replies out loud, and **hands-free** mode keeps listening after each reply so it feels like a conversation.
-- **Photos and documents.** Send photos (screenshots of a group chat, a picture of your room, anything) and PDFs, Word (.docx) or text files (journals, letters, worksheets). It actually reads them and responds to what's in them.
+- **Photos and documents.** Send photos (screenshots of a group chat, a picture of your room, anything) and PDFs, Word (.docx) or text files (journals, letters, worksheets, even whole books). It actually reads them and responds to what's in them. Short documents are read in full. For long ones it reads the opening plus the parts that match what you ask about, and it can find those parts again later in the chat ("remember what my journal said about the ferry?").
 - **It texts you first.** Check-ins arrive as phone notifications. In Settings you choose:
   - on or off
   - how often (every few days → every few hours)
@@ -78,7 +78,7 @@ Same as the Claude version: see [Put it on your iPhone](#4-put-it-on-your-iphone
 - **The AI is different.** Gemma 4 is a capable open model, but Claude is noticeably better at nuanced, emotionally intelligent conversation. The same safety rules apply, and the app also watches for crisis words itself, so the help card appears even if the model misses them.
 - **Photos** are looked at when you send them (Dr. Mochi remembers what it saw afterwards, not the photo itself). The app shrinks photos automatically.
 - **Photos per message.** Dr. Mochi looks at up to 4 photos at a time; if you send more, it asks for the rest separately.
-- **Documents.** PDFs and Word files are turned into text for free when you upload them. Dr. Mochi reads up to ~40,000 characters of new documents per message (shared between them) and keeps a shorter excerpt in mind for the next few messages. Scanned PDFs (pictures of pages) have no text, so send those as photos.
+- **Documents.** Files up to 20 MB with up to about 1,200 pages of text. PDFs and Word files are turned into text for free when you upload them. Short documents are read in full. For long ones, Dr. Mochi sees the opening plus the parts that best match what you say. Ask about a chapter, a name or a phrase, and it finds it. Scanned PDFs (pictures of pages) have no text, so send those as photos.
 - **Talking.** Uses your phone's speech recognition when it's available; otherwise the app records you and Cloudflare's free Whisper model writes down what you said.
 - **Privacy.** Your chats are stored in your own Cloudflare D1 database. Cloudflare says Workers AI doesn't use your messages to train models.
 - **Switch to Claude anytime.** Add a Secret named `ANTHROPIC_API_KEY` (see step 1 below) in **Settings → Variables and Secrets**. Hosting stays free; you only pay Anthropic per message.
@@ -111,7 +111,7 @@ Everything runs on your Mac or PC, including the AI, so it's free and private. T
    Put that address in `.env` as `PUBLIC_URL=https://…`, restart with `npm start`, then follow [Put it on your iPhone](#4-put-it-on-your-iphone) using that address.
 5. **Keep the computer awake** while you want check-ins: on a Mac, run `caffeinate -s` in another Terminal window; on Windows, set sleep to "Never" while plugged in.
 
-Photos and documents work the same way. PDFs are turned into text on your computer; scanned PDFs (pictures of pages) have no text, so send those as photos. Talking out loud uses your phone's own speech recognition (or the keyboard's dictation mic).
+Photos and documents work the same way, with files up to 50 MB (thousands of pages). PDFs are turned into text on your computer, and long documents are searched the same way so they fit the local model. Scanned PDFs (pictures of pages) have no text, so send those as photos. Talking out loud uses your phone's own speech recognition (or the keyboard's dictation mic).
 
 ---
 
@@ -124,7 +124,7 @@ You need two things: a **Claude API key** (this is what makes Dr. Mochi think) a
 1. Go to [console.anthropic.com](https://console.anthropic.com), sign up, and add a payment method under **Billing**.
 2. Open **API Keys** → **Create Key**, and copy it. It starts with `sk-ant-`.
 
-You pay per message. With the default model, a normal text exchange costs roughly a cent or a few cents; photos and long documents cost more. To spend less, set `CLAUDE_MODEL` to `claude-sonnet-5-5` (cheaper) or `claude-haiku-5-5` (much cheaper).
+You pay per message. With the default model, a normal text exchange costs roughly a cent or a few cents; photos and documents cost more. Documents up to about 300 pages of text are read in full; for longer ones Claude gets the opening and the parts that match what you ask, which keeps a book from costing dollars per reply. Small PDFs (up to 100 pages and 10 MB) are read with their pictures and layout. To spend less, set `CLAUDE_MODEL` to `claude-sonnet-5-5` (cheaper) or `claude-haiku-5-5` (much cheaper).
 
 ### 2. Pick an access code
 
@@ -234,7 +234,7 @@ Cloudflare (free) version: the same names work as **Secrets** or **Variables** o
 | --- | --- | --- |
 | `AI_MODEL` | `@cf/google/gemma-4-26b-a4b-it` | The free Workers AI model. `@cf/meta/llama-4-scout-17b-16e-instruct` also sees photos. |
 
-Storage is the `DB` D1 database in `wrangler.jsonc`, created on first deploy. Check-ins run from a Cron Trigger every 5 minutes.
+Storage is the `DB` D1 database in `wrangler.jsonc`, created on first deploy. Check-ins run from a Cron Trigger every 5 minutes. Documents are searched with D1's full-text index; because of it, `wrangler d1 export` needs `--table <name>` (Cloudflare can't export a whole database that has a full-text index).
 
 ## Run it on your computer
 

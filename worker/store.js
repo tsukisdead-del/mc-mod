@@ -1,7 +1,8 @@
 // Storage for the Cloudflare version, all in one D1 (SQLite) database. Files are kept as base64 text:
 // D1 hands BLOBs back as arrays of numbers, which is far too slow for the free plan's 10 ms CPU budget,
-// while base64 is what the AI needs anyway. The app state uses the same shape as the Node server's
-// state.json, so shared logic works on both.
+// while base64 is what the AI needs anyway. A document's text is stored in parts (doc_chunks) with a
+// full-text index, so even a book can be searched for the parts that matter. The app state uses the same
+// shape as the Node server's state.json, so shared logic works on both.
 import { withDefaults } from '../server/settings.js';
 
 const SCHEMA = [
@@ -10,18 +11,33 @@ const SCHEMA = [
      id TEXT PRIMARY KEY, created_at INTEGER NOT NULL, role TEXT NOT NULL, kind TEXT NOT NULL,
      text TEXT NOT NULL, attachments TEXT NOT NULL DEFAULT '[]', mood TEXT, crisis INTEGER NOT NULL DEFAULT 0)`,
   'CREATE INDEX IF NOT EXISTS messages_by_time ON messages (created_at)',
+  // text: a document's opening (older versions stored all of it); chars/tokens/chunks/pages describe the whole.
   `CREATE TABLE IF NOT EXISTS attachments (
      id TEXT PRIMARY KEY, created_at INTEGER NOT NULL, name TEXT NOT NULL, kind TEXT NOT NULL,
-     mime TEXT NOT NULL, size INTEGER NOT NULL, text TEXT)`,
+     mime TEXT NOT NULL, size INTEGER NOT NULL, text TEXT, chars INTEGER, tokens INTEGER, chunks INTEGER, pages INTEGER)`,
   'CREATE TABLE IF NOT EXISTS files (id TEXT PRIMARY KEY, data TEXT NOT NULL)',
   `CREATE TABLE IF NOT EXISTS push_subscriptions (
      endpoint TEXT PRIMARY KEY, p256dh TEXT NOT NULL, auth TEXT NOT NULL, user_agent TEXT, created_at INTEGER NOT NULL, session TEXT)`,
+  'CREATE TABLE IF NOT EXISTS doc_chunks (id INTEGER PRIMARY KEY, doc_id TEXT NOT NULL, seq INTEGER NOT NULL, body TEXT NOT NULL)',
+  'CREATE INDEX IF NOT EXISTS doc_chunks_by_doc ON doc_chunks (doc_id, seq)',
+  // Full-text index over the parts (English stemming, accents ignored). It reads the text from doc_chunks.
+  `CREATE VIRTUAL TABLE IF NOT EXISTS doc_chunks_fts USING fts5(
+     body, content='doc_chunks', content_rowid='id', tokenize='porter unicode61 remove_diacritics 2')`,
 ];
 // Changes for databases made by an older version of this file, applied once (tracked in kv 'schema_version').
 const MIGRATIONS = [
   // 1: tie push subscriptions to the session that registered them
   'ALTER TABLE push_subscriptions ADD COLUMN session TEXT',
+  // 2-5: long documents are stored in parts
+  'ALTER TABLE attachments ADD COLUMN chars INTEGER',
+  'ALTER TABLE attachments ADD COLUMN tokens INTEGER',
+  'ALTER TABLE attachments ADD COLUMN chunks INTEGER',
+  'ALTER TABLE attachments ADD COLUMN pages INTEGER',
 ];
+// Parts per insert batch: keeps each D1 call well under its size limits.
+const CHUNK_BATCH = 100;
+// How much of a document's start is kept with its attachment row (for overviews).
+export const OPENING_CHARS = 8000;
 
 let schemaReady = null;
 
@@ -133,10 +149,7 @@ export class Store {
 
   // Drops counters whose window has ended.
   async dropExpired(prefix) {
-    await this.db
-      .prepare("DELETE FROM kv WHERE key LIKE ? AND json_extract(value, '$.resetAt') < ?")
-      .bind(`${prefix}%`, Date.now())
-      .run();
+    await this.db.prepare("DELETE FROM kv WHERE key LIKE ? AND json_extract(value, '$.resetAt') < ?").bind(`${prefix}%`, Date.now()).run();
   }
 
   // A short-lived lock (it expires on its own if the Worker is stopped). Returns a token, or null if it's taken.
@@ -159,9 +172,7 @@ export class Store {
 
   // Settings, memory notes, check-in schedule and bookkeeping in one round trip.
   async loadState() {
-    const { results } = await this.db
-      .prepare("SELECT key, value FROM kv WHERE key IN ('settings', 'memory', 'checkin', 'meta')")
-      .all();
+    const { results } = await this.db.prepare("SELECT key, value FROM kv WHERE key IN ('settings', 'memory', 'checkin', 'meta')").all();
     const v = Object.fromEntries(results.map((r) => [r.key, JSON.parse(r.value)]));
     const meta = { historyStart: 0, lastUserMessageAt: null, ...(v.meta || {}) };
     return {
@@ -255,35 +266,152 @@ export class Store {
   }
 
   async deleteAllMessages() {
-    await this.db.batch([this.db.prepare('DELETE FROM messages'), this.db.prepare('DELETE FROM attachments'), this.db.prepare('DELETE FROM files')]);
+    await this.db.batch([
+      this.db.prepare('DELETE FROM messages'),
+      this.db.prepare('DELETE FROM attachments'),
+      this.db.prepare('DELETE FROM files'),
+      this.db.prepare("INSERT INTO doc_chunks_fts (doc_chunks_fts) VALUES ('delete-all')"),
+      this.db.prepare('DELETE FROM doc_chunks'),
+    ]);
   }
 
   // ---------- attachments ----------
 
   // base64: the original file (photos always; documents only when small enough to fit in a D1 row).
-  async saveAttachment({ name, kind, mime, size, text }, base64) {
+  // doc: { text, parts, tokens, pages } for documents: the text is stored in parts and indexed for search.
+  async saveAttachment({ name, kind, mime, size }, base64, doc = null) {
     const id = Date.now().toString(36) + randomHex(5);
     const meta = { id, name, kind, mime, size, createdAt: Date.now() };
-    const stmts = [
-      this.db
-        .prepare('INSERT INTO attachments (id, created_at, name, kind, mime, size, text) VALUES (?, ?, ?, ?, ?, ?, ?)')
-        .bind(id, meta.createdAt, name, kind, mime, size, text ?? null),
-    ];
-    if (base64) stmts.push(this.db.prepare('INSERT INTO files (id, data) VALUES (?, ?)').bind(id, base64));
-    await this.db.batch(stmts);
+    let indexed = false;
+    try {
+      if (doc) {
+        // Parts first, then the search index, then the attachment row: a failure leaves nothing that's used.
+        const insert = this.db.prepare('INSERT INTO doc_chunks (doc_id, seq, body) VALUES (?, ?, ?)');
+        for (let i = 0; i < doc.parts.length; i += CHUNK_BATCH) {
+          await this.db.batch(doc.parts.slice(i, i + CHUNK_BATCH).map(([a, b], j) => insert.bind(id, i + j, doc.text.slice(a, b))));
+        }
+        await this.db.prepare('INSERT INTO doc_chunks_fts (rowid, body) SELECT id, body FROM doc_chunks WHERE doc_id = ?').bind(id).run();
+        indexed = true;
+      }
+      const stmts = [
+        this.db
+          .prepare(
+            'INSERT INTO attachments (id, created_at, name, kind, mime, size, text, chars, tokens, chunks, pages) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+          )
+          .bind(
+            id,
+            meta.createdAt,
+            name,
+            kind,
+            mime,
+            size,
+            doc ? doc.text.slice(0, OPENING_CHARS) : null,
+            doc ? doc.text.length : null,
+            doc ? doc.tokens : null,
+            doc ? doc.parts.length : null,
+            doc?.pages ?? null,
+          ),
+      ];
+      if (base64) stmts.push(this.db.prepare('INSERT INTO files (id, data) VALUES (?, ?)').bind(id, base64));
+      await this.db.batch(stmts);
+    } catch (err) {
+      // Search entries may only be removed for parts that were indexed; otherwise the index breaks.
+      if (indexed) await this.deleteDocument(id).catch(() => {});
+      else if (doc)
+        await this.db
+          .prepare('DELETE FROM doc_chunks WHERE doc_id = ?')
+          .bind(id)
+          .run()
+          .catch(() => {});
+      throw err;
+    }
     return meta;
   }
 
-  // id -> metadata. `text`: true adds the extracted text, a number adds only its first that-many characters.
+  // Removes a document's parts and their search entries.
+  async deleteDocument(id) {
+    await this.db.batch([
+      this.db.prepare("INSERT INTO doc_chunks_fts (doc_chunks_fts, rowid, body) SELECT 'delete', id, body FROM doc_chunks WHERE doc_id = ?").bind(id),
+      this.db.prepare('DELETE FROM doc_chunks WHERE doc_id = ?').bind(id),
+    ]);
+  }
+
+  // ---------- document parts ----------
+
+  // Every part of these documents, in order: id -> text. (For documents small enough to send whole.)
+  async documentTexts(ids) {
+    const unique = uniqueIds(ids);
+    if (!unique.length) return {};
+    const { results } = await this.db
+      .prepare('SELECT doc_id, body FROM doc_chunks WHERE doc_id IN (SELECT value FROM json_each(?)) ORDER BY doc_id, seq')
+      .bind(JSON.stringify(unique))
+      .all();
+    const out = {};
+    for (const r of results) out[r.doc_id] = (out[r.doc_id] || '') + r.body;
+    return out;
+  }
+
+  // Best-matching parts of these documents for an FTS5 query, best first: [{ docId, seq, text }].
+  async searchDocuments(ids, match, limit) {
+    const unique = uniqueIds(ids);
+    if (!unique.length || !match) return [];
+    try {
+      const { results } = await this.db
+        .prepare(
+          `SELECT c.doc_id, c.seq, c.body FROM doc_chunks_fts f JOIN doc_chunks c ON c.id = f.rowid
+           WHERE doc_chunks_fts MATCH ?1 AND c.doc_id IN (SELECT value FROM json_each(?2)) ORDER BY f.rank LIMIT ?3`,
+        )
+        .bind(match, JSON.stringify(unique), limit)
+        .all();
+      return results.map((r) => ({ docId: r.doc_id, seq: r.seq, text: r.body }));
+    } catch (err) {
+      console.error('Document search failed:', err?.message || err);
+      return [];
+    }
+  }
+
+  // Specific parts: pairs of [docId, seq] -> [{ docId, seq, text }].
+  async documentParts(pairs) {
+    if (!pairs.length) return [];
+    const { results } = await this.db
+      .prepare(
+        `SELECT c.doc_id, c.seq, c.body FROM json_each(?) j
+         JOIN doc_chunks c ON c.doc_id = (j.value ->> '$[0]') AND c.seq = (j.value ->> '$[1]')`,
+      )
+      .bind(JSON.stringify(pairs))
+      .all();
+    return results.map((r) => ({ docId: r.doc_id, seq: r.seq, text: r.body }));
+  }
+
+  // id -> metadata. `text`: true adds the stored text, a number adds only its first that-many characters.
+  // Documents stored before parts existed have no chars/chunks; their whole text is in `text` (textLength).
   // The ids go in as one JSON value: D1 allows only 100 bound parameters per query.
   async attachmentMap(ids, { text = false } = {}) {
     const unique = uniqueIds(ids);
     if (!unique.length) return {};
     const textCol = text === true ? ', text' : text ? ', substr(text, 1, ?2) AS text' : '';
-    const stmt = this.db.prepare(`SELECT id, created_at, name, kind, mime, size${textCol} FROM attachments WHERE id IN (SELECT value FROM json_each(?1))`);
+    const stmt = this.db.prepare(
+      `SELECT id, created_at, name, kind, mime, size, chars, tokens, chunks, pages, length(text) AS text_length${textCol}
+       FROM attachments WHERE id IN (SELECT value FROM json_each(?1))`,
+    );
     const { results } = await (typeof text === 'number' ? stmt.bind(JSON.stringify(unique), text) : stmt.bind(JSON.stringify(unique))).all();
     return Object.fromEntries(
-      results.map((r) => [r.id, { id: r.id, name: r.name, kind: r.kind, mime: r.mime, size: r.size, createdAt: r.created_at, text: r.text ?? undefined }]),
+      results.map((r) => [
+        r.id,
+        {
+          id: r.id,
+          name: r.name,
+          kind: r.kind,
+          mime: r.mime,
+          size: r.size,
+          createdAt: r.created_at,
+          chars: r.chars ?? r.text_length ?? 0,
+          tokens: r.tokens ?? undefined,
+          chunks: r.chunks ?? 0,
+          pages: r.pages ?? undefined,
+          text: r.text ?? undefined,
+        },
+      ]),
     );
   }
 
@@ -291,7 +419,10 @@ export class Store {
   async fileData(ids) {
     const unique = uniqueIds(ids);
     if (!unique.length) return {};
-    const { results } = await this.db.prepare('SELECT id, data FROM files WHERE id IN (SELECT value FROM json_each(?))').bind(JSON.stringify(unique)).all();
+    const { results } = await this.db
+      .prepare('SELECT id, data FROM files WHERE id IN (SELECT value FROM json_each(?))')
+      .bind(JSON.stringify(unique))
+      .all();
     return Object.fromEntries(results.map((r) => [r.id, r.data]));
   }
 

@@ -2,69 +2,21 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-let sqlite = null;
-try {
-  sqlite = await import('node:sqlite');
-} catch {
-  // Node without built-in SQLite: these tests are skipped.
-}
+import { newStore, skipWithoutSqlite as skip } from './helpers/d1.js';
+import { chunkText, charsPerToken, CHUNK_CHARS } from '../server/doc-search.js';
 
-// Just enough of the D1 binding: prepare/bind/first/all/run and batch (one transaction).
-function fakeD1(db) {
-  const returnsRows = (sql) => /^\s*(SELECT|WITH)\b|\bRETURNING\b/i.test(sql);
-  const statement = (sql, params = []) => ({
-    bind: (...p) => statement(sql, p),
-    async first() {
-      return db.prepare(sql).get(...params) ?? null;
-    },
-    async all() {
-      return { results: db.prepare(sql).all(...params) };
-    },
-    async run() {
-      return this.exec();
-    },
-    exec() {
-      const st = db.prepare(sql);
-      if (returnsRows(sql)) {
-        const results = st.all(...params);
-        return { results, meta: { changes: results.length } };
-      }
-      return { results: [], meta: { changes: Number(st.run(...params).changes) } };
-    },
-  });
-  return {
-    prepare: (sql) => statement(sql),
-    async batch(list) {
-      db.exec('BEGIN');
-      try {
-        const out = list.map((s) => s.exec());
-        db.exec('COMMIT');
-        return out;
-      } catch (err) {
-        db.exec('ROLLBACK');
-        throw err;
-      }
-    },
-  };
-}
+const docOf = (text) => ({ text, parts: chunkText(text), tokens: Math.ceil(text.length / charsPerToken(text)) });
 
-// A fresh copy of store.js per database (it remembers per isolate that the schema is ready).
-let copies = 0;
-async function newStore(setup) {
-  const db = new sqlite.DatabaseSync(':memory:');
-  setup?.(db);
-  const { Store } = await import(`../worker/store.js?copy=${++copies}`);
-  return { db, store: await new Store({ DB: fakeD1(db) }).init() };
-}
-
-const skip = !sqlite && 'node:sqlite is not available';
-
-test('a database from before push sessions gets the new column once', { skip }, async () => {
+test('a database from an older version gets the new columns once', { skip }, async () => {
   const { db, store } = await newStore((db) => {
     db.exec('CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)');
     db.exec(
       'CREATE TABLE push_subscriptions (endpoint TEXT PRIMARY KEY, p256dh TEXT NOT NULL, auth TEXT NOT NULL, user_agent TEXT, created_at INTEGER NOT NULL)',
     );
+    db.exec(
+      'CREATE TABLE attachments (id TEXT PRIMARY KEY, created_at INTEGER NOT NULL, name TEXT NOT NULL, kind TEXT NOT NULL, mime TEXT NOT NULL, size INTEGER NOT NULL, text TEXT)',
+    );
+    db.exec("INSERT INTO attachments VALUES ('old1', 1, 'old.txt', 'text', 'text/plain', 5, 'hello there')");
   });
   assert.ok(
     db
@@ -72,10 +24,20 @@ test('a database from before push sessions gets the new column once', { skip }, 
       .all()
       .some((c) => c.name === 'session'),
   );
-  assert.equal(await store.get('schema_version'), 1);
+  const cols = db
+    .prepare('PRAGMA table_info(attachments)')
+    .all()
+    .map((c) => c.name);
+  for (const c of ['chars', 'tokens', 'chunks', 'pages']) assert.ok(cols.includes(c), c);
+  assert.equal(await store.get('schema_version'), 5);
+  // A document saved before parts existed still reads: its whole text is with the attachment.
+  const old = (await store.attachmentMap(['old1'], { text: true })).old1;
+  assert.equal(old.chars, 11);
+  assert.equal(old.chunks, 0);
+  assert.equal(old.text, 'hello there');
   // and a brand-new database is marked up to date too
   const fresh = await newStore();
-  assert.equal(await fresh.store.get('schema_version'), 1);
+  assert.equal(await fresh.store.get('schema_version'), 5);
 });
 
 test('looking up more than 100 attachments at once works (D1 allows 100 bound parameters)', { skip }, async () => {
@@ -85,7 +47,7 @@ test('looking up more than 100 attachments at once works (D1 allows 100 bound pa
     const meta = await store.saveAttachment({ name: `p${i}.jpg`, kind: 'image', mime: 'image/jpeg', size: 3 }, `DATA${i}`);
     ids.push(meta.id);
   }
-  const doc = await store.saveAttachment({ name: 'long.txt', kind: 'text', mime: 'text/plain', size: 9, text: 'x'.repeat(5000) }, null);
+  const doc = await store.saveAttachment({ name: 'long.txt', kind: 'text', mime: 'text/plain', size: 9 }, null, docOf('x'.repeat(5000)));
   const metas = await store.attachmentMap([...ids, doc.id, 'missing', ids[0]]);
   assert.equal(Object.keys(metas).length, 151);
   assert.equal(metas[doc.id].text, undefined);
@@ -179,4 +141,73 @@ test('push devices are tied to the login that registered them', { skip }, async 
   // Registering again under the new code moves the device over.
   await store.addPushSubscription(sub(2), 'laptop', 'newer');
   assert.equal(await store.countPushSubscriptions('newer'), 1);
+});
+
+test('a long document is stored in parts, searchable, and comes back exactly', { skip }, async () => {
+  const { store, d1 } = await newStore();
+  const paragraphs = Array.from({ length: 600 }, (_, i) =>
+    i === 420
+      ? 'Natasha went to the opera with Anatole, and it changed everything.'
+      : `Paragraph ${i}: the weather was ordinary and nothing much happened that day.`,
+  );
+  const text = paragraphs.join('\n\n');
+  const before = d1.queries;
+  const meta = await store.saveAttachment({ name: 'novel.txt', kind: 'text', mime: 'text/plain', size: text.length }, null, docOf(text));
+  const parts = chunkText(text);
+  assert.ok(parts.length > 10);
+  // one batch per 100 parts, one index fill, one attachment row
+  assert.equal(d1.queries - before, Math.ceil(parts.length / 100) + 2);
+  const m = (await store.attachmentMap([meta.id]))[meta.id];
+  assert.equal(m.chars, text.length);
+  assert.equal(m.chunks, parts.length);
+  assert.ok(m.tokens > 1000);
+  // The attachment row keeps only the opening; the parts hold all of it.
+  assert.equal((await store.attachmentMap([meta.id], { text: true }))[meta.id].text.length, 8000);
+  assert.equal((await store.documentTexts([meta.id]))[meta.id], text);
+
+  const hits = await store.searchDocuments([meta.id], '"natasha" OR "operas"', 5);
+  assert.equal(hits.length, 1);
+  assert.match(hits[0].text, /Natasha went to the opera/);
+  assert.ok(text.slice(...parts[hits[0].seq]).includes('Natasha'));
+  // Only the documents asked for are searched; a broken query finds nothing instead of failing.
+  assert.deepEqual(await store.searchDocuments(['someone-else'], '"natasha"', 5), []);
+  assert.deepEqual(await store.searchDocuments([meta.id], 'opera"', 5), []);
+
+  const some = await store.documentParts([
+    [meta.id, 0],
+    [meta.id, 3],
+    [meta.id, 99999],
+  ]);
+  assert.deepEqual(
+    some.map((p) => p.seq).sort((a, b) => a - b),
+    [0, 3],
+  );
+  assert.equal(some.find((p) => p.seq === 3).text, text.slice(...parts[3]));
+});
+
+test('deleting history wipes document parts and their search index', { skip }, async () => {
+  const { store, db } = await newStore();
+  const a = await store.saveAttachment({ name: 'a.txt', kind: 'text', mime: 'text/plain', size: 1 }, null, docOf('apples and pears '.repeat(400)));
+  await store.saveAttachment({ name: 'b.txt', kind: 'text', mime: 'text/plain', size: 1 }, null, docOf('bananas '.repeat(400)));
+  await store.deleteDocument(a.id);
+  assert.deepEqual(await store.searchDocuments([a.id], '"apples"', 5), []);
+  assert.ok(db.prepare('SELECT COUNT(*) AS n FROM doc_chunks').get().n > 0);
+  await store.deleteAllMessages();
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM doc_chunks').get().n, 0);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM doc_chunks_fts WHERE doc_chunks_fts MATCH 'bananas'").get().n, 0);
+});
+
+test('a failed upload leaves no parts behind', { skip }, async () => {
+  const { store, db, d1 } = await newStore();
+  const realBatch = d1.batch.bind(d1);
+  let calls = 0;
+  d1.batch = async (list) => {
+    if (++calls === 2) throw new Error('D1_ERROR: overloaded');
+    return realBatch(list);
+  };
+  const text = 'word '.repeat(CHUNK_CHARS * 60);
+  await assert.rejects(store.saveAttachment({ name: 'big.txt', kind: 'text', mime: 'text/plain', size: 1 }, null, docOf(text)), /overloaded/);
+  d1.batch = realBatch;
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM doc_chunks').get().n, 0);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM attachments').get().n, 0);
 });

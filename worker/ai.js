@@ -9,6 +9,8 @@ import { buildTurns, resolveFiles, appendUserNote, transcript, nextHistoryStart,
 import { looksLikeCrisis, CRISIS_NOTE } from '../server/safety.js';
 import { mockReplyText, mockCheckinText, mockMemoryText, streamMock } from '../server/mock.js';
 import { filePlaceholder } from '../server/file-types.js';
+import { DOC_BUDGETS, planDocuments, pickParts, queryTerms, ftsQuery, overviewText, excerptText, searchTextFor } from '../server/doc-search.js';
+import { OPENING_CHARS } from './store.js';
 import { FORMAT_REMINDER, simpleCheckin, readStream, textFromResult, finishFromResult, toChatMessages } from '../server/open-models.js';
 
 // Workers AI models we know how to talk to. Rates are neurons per million tokens (from Cloudflare's pricing).
@@ -33,13 +35,13 @@ export const FREE_NEURONS_PER_DAY = 10000;
 
 // The free plan's budget is tight (10,000 neurons a day, 10 ms of CPU per request), so the free model sees a
 // shorter verbatim history (the memory notes carry the rest). On both providers, photos and PDFs go in full only
-// on the turn they're sent; documents are trimmed, with less of them once they're a few messages old.
+// on the turn they're sent. Documents go in whole when they're short and recent; long ones (and older ones) are
+// searched, and only their opening plus the parts that match what they said are sent (see doc-search.js).
 const FREE_WINDOW = { max: 40, keep: 20 };
 const RECENT_DOC_MESSAGES = 6;
-const FILE_BUDGET = {
-  free: { photos: 4, freshDocChars: 40000, olderDocChars: 12000 },
-  claude: { photos: 6, freshDocChars: 150000, olderDocChars: 30000 },
-};
+const MAX_PHOTOS = { free: 4, claude: 6 };
+// PDFs this small keep their original in D1 (worker/files.js), so Claude can see their pages.
+const STORED_PDF_BYTES = 1_400_000;
 // Rough prompt-token cost of one photo, for the usage meter when the model doesn't report usage.
 const PHOTO_TOKENS = 300;
 
@@ -70,10 +72,11 @@ export function friendlyMessage(err, timezone = 'UTC') {
   if (isQuotaError(err)) {
     return `I've used up today's free thinking time 😴 I'll be fully recharged at ${utcMidnightLocal(timezone)} your time. (The free AI resets every day at midnight UTC.)`;
   }
-  if (/\b3040\b|capacity temporarily exceeded/i.test(msg)) return "Lots of people are talking to the free AI right now. Try again in a minute?";
+  if (/\b3040\b|capacity temporarily exceeded/i.test(msg)) return 'Lots of people are talking to the free AI right now. Try again in a minute?';
   if (/\b300[78]\b|request timeout/i.test(msg)) return 'The free AI is running slow right now. Try again in a minute?';
-  if (/\b5035\b|requires (a )?Workers Paid/i.test(msg)) return 'That AI model needs a paid Cloudflare plan. Remove the AI_MODEL setting to use the free one.';
-  if (/\b5016\b/.test(msg)) return "That AI model needs its license accepted first. Remove the AI_MODEL setting to use the default one.";
+  if (/\b5035\b|requires (a )?Workers Paid/i.test(msg))
+    return 'That AI model needs a paid Cloudflare plan. Remove the AI_MODEL setting to use the free one.';
+  if (/\b5016\b/.test(msg)) return 'That AI model needs its license accepted first. Remove the AI_MODEL setting to use the default one.';
   if (err instanceof Anthropic.AuthenticationError) return "The Claude API key isn't working. Double-check the ANTHROPIC_API_KEY secret.";
   if (err instanceof Anthropic.RateLimitError) return "I'm getting a lot of messages at once. Give it a minute and try again.";
   if (err instanceof Anthropic.BadRequestError) return "Something about that message didn't work (a file might be too big). Try again without it?";
@@ -152,7 +155,8 @@ export function createAI(env, store) {
 
   // ----- conversation building -----
 
-  async function history(state) {
+  // search: look in long documents for what their newest messages are about (replies do; check-ins don't).
+  async function history(state, { search = false } = {}) {
     const messages = await store.messagesSince(state.historyStart);
     // Attachments of the messages still waiting for a reply ("fresh"): photos and PDFs are only sent then.
     let lastReply = -1;
@@ -161,36 +165,101 @@ export function createAI(env, store) {
     const metas = await store.attachmentMap(messages.flatMap((m) => m.attachments || []));
     const placeholder = (ids) => filePlaceholder((ids || []).map((id) => metas[id]));
     const turns = buildTurns(messages, { timezone: state.settings.timezone, filePlaceholder: placeholder, recentFiles: RECENT_DOC_MESSAGES });
-    const files = await loadFiles(turns, metas, fresh);
-    return resolveFiles(turns, (ids) => (provider === 'anthropic' ? claudeFiles(ids, files) : openFiles(ids, files)));
+    const files = await loadFiles(turns, metas, fresh, search ? searchTextFor(messages) : '');
+    await resolveFiles(turns, (ids) => (provider === 'anthropic' ? claudeFiles(ids, files) : openFiles(ids, files)));
+    // Matching parts of long documents go with their newest message, so earlier turns never change.
+    if (files.excerpts.length && turns.at(-1)?.role === 'user') appendUserNote(turns, files.excerpts.join('\n\n'));
+    return turns;
   }
 
-  // Decides what each file in the conversation becomes, loading everything needed in (at most) two queries.
-  async function loadFiles(turns, metas, fresh) {
-    const budget = free ? FILE_BUDGET.free : FILE_BUDGET.claude;
-    const ids = turns.flatMap((t) => t.content.filter((p) => p.type === 'files').flatMap((p) => p.ids)).filter((id) => metas[id]);
+  // Decides what each file in the conversation becomes and loads it, in about four queries run side by side.
+  async function loadFiles(turns, metas, fresh, query) {
+    const budget = free ? DOC_BUDGETS.free : DOC_BUDGETS.claude;
+    const maxPhotos = free ? MAX_PHOTOS.free : MAX_PHOTOS.claude;
+    const recentIds = turns.flatMap((t) => t.content.filter((p) => p.type === 'files').flatMap((p) => p.ids)).filter((id) => metas[id]);
+    const recent = new Set(recentIds);
     const canSee = provider === 'anthropic' || info.vision;
-    const photos = ids.filter((id) => metas[id].kind === 'image' && canSee && fresh.has(id)).slice(0, budget.photos);
-    const pdfs = provider === 'anthropic' ? ids.filter((id) => metas[id].kind === 'pdf' && fresh.has(id)) : [];
-    const docs = ids.filter((id) => metas[id].kind !== 'image');
-    const [data, texts] = await Promise.all([
-      store.fileData([...photos, ...pdfs]),
-      store.attachmentMap(docs, { text: budget.freshDocChars + 1 }),
+    const photos = recentIds.filter((id) => metas[id].kind === 'image' && canSee && fresh.has(id)).slice(0, maxPhotos);
+    // Claude reads a new, small PDF itself (pages and all); everything else is read as text.
+    const native = new Set(
+      provider === 'anthropic' ? recentIds.filter((id) => metas[id].kind === 'pdf' && fresh.has(id) && metas[id].size <= STORED_PDF_BYTES) : [],
+    );
+    // Recent documents as before; older ones in the conversation only to search them.
+    const docs = Object.values(metas)
+      .filter((m) => m.kind !== 'image' && !native.has(m.id) && (recent.has(m.id) || m.chunks > 0))
+      .map((m) => ({
+        id: m.id,
+        meta: m,
+        tokens: m.tokens ?? Math.ceil(m.chars / 3.5),
+        cpt: m.tokens ? m.chars / m.tokens : 3.5,
+        chunks: m.chunks,
+        fresh: fresh.has(m.id),
+        recent: recent.has(m.id),
+      }));
+    const plan = planDocuments(docs, budget);
+    for (const d of docs) d.mode = plan.get(d.id);
+    const inline = docs.filter((d) => d.mode === 'inline');
+    const long = docs.filter((d) => d.mode === 'long');
+    const searchable = docs.filter((d) => d.mode !== 'inline' && d.chunks > 0);
+    const terms = query ? queryTerms(query) : [];
+    const [data, texts, legacyTexts, openings, matches] = await Promise.all([
+      store.fileData([...photos, ...native]),
+      store.documentTexts(inline.filter((d) => d.chunks > 0).map((d) => d.id)),
+      // Documents saved by older versions keep all their text with the attachment.
+      store.attachmentMap(
+        inline.filter((d) => !d.chunks).map((d) => d.id),
+        { text: true },
+      ),
+      store.attachmentMap(
+        long.map((d) => d.id),
+        { text: OPENING_CHARS },
+      ),
+      terms.length && searchable.length
+        ? store.searchDocuments(
+            searchable.map((d) => d.id),
+            ftsQuery(terms),
+            budget.maxParts * 2,
+          )
+        : [],
     ]);
-    // Share the character budget between the documents of each kind.
-    const freshDocs = docs.filter((id) => fresh.has(id) && !data[id]).length;
-    const olderDocs = docs.filter((id) => !fresh.has(id)).length;
-    const limit = (id) => Math.floor(fresh.has(id) ? budget.freshDocChars / Math.max(freshDocs, 1) : budget.olderDocChars / Math.max(olderDocs, 1));
-    const hidden = new Set(ids.filter((id) => metas[id].kind === 'image' && canSee && fresh.has(id) && !photos.includes(id)));
-    return { metas, data, texts, limit, canSee, hidden, maxPhotos: budget.photos };
+    for (const [id, m] of Object.entries(legacyTexts)) texts[id] = m.text || '';
+
+    // Matching parts first, then samples for long documents that matched little.
+    const picked = pickParts({ docs: searchable, matches, budget });
+    const have = new Map(matches.map((m) => [`${m.docId}:${m.seq}`, m.text]));
+    const missing = [...picked].flatMap(([id, seqs]) => seqs.filter((seq) => !have.has(`${id}:${seq}`)).map((seq) => [id, seq]));
+    for (const p of await store.documentParts(missing)) have.set(`${p.docId}:${p.seq}`, p.text);
+    const excerpts = searchable
+      .filter((d) => picked.get(d.id)?.length)
+      .sort((a, b) => Number(b.fresh) - Number(a.fresh))
+      .map((d) =>
+        excerptText({
+          name: d.meta.name,
+          pages: d.meta.pages,
+          chars: d.meta.chars,
+          chunks: d.chunks,
+          older: d.mode === 'search',
+          parts: picked.get(d.id).map((seq) => ({ seq, text: have.get(`${d.id}:${seq}`) || '' })),
+        }),
+      );
+    const hidden = new Set(recentIds.filter((id) => metas[id].kind === 'image' && canSee && fresh.has(id) && !photos.includes(id)));
+    return {
+      metas,
+      data,
+      texts,
+      openings: Object.fromEntries(long.map((d) => [d.id, (openings[d.id]?.text || '').slice(0, Math.floor(budget.overview * d.cpt))])),
+      plan,
+      excerpts,
+      canSee,
+      hidden,
+      maxPhotos,
+    };
   }
 
   function docText(id, f) {
     const m = f.metas[id];
-    const text = f.texts[id]?.text || '';
-    const max = f.limit(id);
-    const cut = text.length > max;
-    return `[Document they sent: "${m.name}"]\n${cut ? text.slice(0, max) : text}${cut ? '\n[Only the first part of this document fit; say so if it matters.]' : ''}`;
+    if (f.plan.get(id) === 'long') return overviewText({ name: m.name, pages: m.pages, chars: m.chars, opening: f.openings[id] || '' });
+    return `[Document they sent: "${m.name}"]\n${f.texts[id] || ''}`;
   }
 
   function photoNote(m, f) {
@@ -221,9 +290,11 @@ export function createAI(env, store) {
       const m = f.metas[id];
       if (!m) continue;
       const data = f.data[id];
-      if (m.kind === 'image') blocks.push(data ? { type: 'image', source: { type: 'base64', media_type: m.mime, data } } : { type: 'text', text: photoNote(m, f) });
-      else if (m.kind === 'pdf' && data) blocks.push({ type: 'document', title: m.name, source: { type: 'base64', media_type: 'application/pdf', data } });
-      else if (f.texts[id]?.text) blocks.push({ type: 'text', text: docText(id, f) });
+      if (m.kind === 'image')
+        blocks.push(data ? { type: 'image', source: { type: 'base64', media_type: m.mime, data } } : { type: 'text', text: photoNote(m, f) });
+      else if (m.kind === 'pdf' && data)
+        blocks.push({ type: 'document', title: m.name, source: { type: 'base64', media_type: 'application/pdf', data } });
+      else blocks.push({ type: 'text', text: docText(id, f) });
     }
     return blocks;
   }
@@ -330,7 +401,7 @@ export function createAI(env, store) {
         await streamMock(raw, onDelta);
         return { raw, risk, answers };
       }
-      const turns = await history(state);
+      const turns = await history(state, { search: true });
       if (turns.at(-1)?.role !== 'user') throw new Error('There is nothing new to reply to.');
       if (risk) appendUserNote(turns, CRISIS_NOTE);
 
@@ -358,7 +429,9 @@ export function createAI(env, store) {
       const turns = appendUserNote(await history(state), note);
       try {
         if (provider === 'anthropic') {
-          const final = await claudeClient().beta.messages.stream(claudeParams(state, turns, { effort: 'low', maxTokens: 16000 })).finalMessage();
+          const final = await claudeClient()
+            .beta.messages.stream(claudeParams(state, turns, { effort: 'low', maxTokens: 16000 }))
+            .finalMessage();
           return final.stop_reason === 'refusal' ? null : claudeText(final) || null;
         }
         return (await runWithFallback(toChatMessages(systemText(state), turns), { stream: false, maxTokens: 300 })).text.trim() || null;
@@ -385,7 +458,9 @@ export function createAI(env, store) {
         const prompt = `Current notes:\n${state.memory.text || '(none yet)'}\n\nNewest conversation:\n${convo}`;
         if (provider === 'anthropic') {
           const final = await claudeClient()
-            .beta.messages.stream(claudeParams(state, [{ role: 'user', content: prompt }], { effort: 'low', maxTokens: 16000, system: MEMORY_INSTRUCTIONS }))
+            .beta.messages.stream(
+              claudeParams(state, [{ role: 'user', content: prompt }], { effort: 'low', maxTokens: 16000, system: MEMORY_INSTRUCTIONS }),
+            )
             .finalMessage();
           if (final.stop_reason === 'refusal') return;
           notes = claudeText(final);
@@ -424,4 +499,3 @@ export function createAI(env, store) {
     },
   };
 }
-

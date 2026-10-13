@@ -100,3 +100,68 @@ test('login limits count IPv6 users by their /64', () => {
   assert.equal(addressBucket('2001:db8::1'), '2001:db8:0:0::/64');
   assert.equal(addressBucket(null), 'unknown');
 });
+
+test('Word XML is read as paragraphs, tabs and line breaks', async () => {
+  const { wordXmlText } = await import('../server/attachments.js').catch(() => ({}));
+  if (!wordXmlText) return; // needs the Node server's modules
+  const xml = '<w:body><w:p><w:r><w:t>Dear diary,</w:t></w:r></w:p><w:p><w:r><w:t xml:space="preserve">Today &amp; </w:t><w:tab/><w:t>tomorrow</w:t><w:br/><w:t>&lt;3</w:t></w:r></w:p></w:body>';
+  assert.equal(wordXmlText(xml), 'Dear diary,\n\nToday & \ttomorrow\n<3\n\n');
+});
+
+test('document search: parts cover the text, common words are ignored, follow-ups reuse the question', async () => {
+  const { chunkText, queryTerms, ftsQuery, searchTextFor } = await import('../server/doc-search.js');
+  const text = 'One. Two three.\n\n'.repeat(500);
+  const parts = chunkText(text, 300);
+  assert.equal(parts.map(([a, b]) => text.slice(a, b)).join(''), text);
+  assert.ok(parts.every(([a, b]) => b - a <= 300));
+  assert.deepEqual(queryTerms('What do you think about my essay on grief?'), ['essay', 'grief']);
+  assert.equal(ftsQuery(['grief', 'say "hi"']), '"grief" OR "say hi"');
+  const m = (role, text) => ({ role, text });
+  assert.equal(searchTextFor([m('user', 'tell me about the ferry'), m('assistant', 'ok'), m('user', 'why?')]), 'tell me about the ferry');
+  assert.equal(searchTextFor([m('user', 'tell me about the ferry'), m('assistant', 'ok'), m('user', 'anyway, lunch was great')]), 'anyway, lunch was great');
+});
+
+test('speech pieces are joined without the repeats iPhone and Android send', async () => {
+  const { assemble, mergePiece, fixName } = await import('../public/js/transcript.js');
+  const R = (t, isFinal) => Object.assign([{ transcript: t }], { isFinal: Boolean(isFinal) });
+  // WebKit: the list holds earlier finals plus the newest result.
+  const webkit = (updates) => {
+    const finals = [];
+    let last = [];
+    for (const [t, fin] of updates) {
+      last = [...finals, R(t, fin)];
+      if (fin) finals.push(R(t, fin));
+    }
+    return last;
+  };
+  const cases = [
+    // the reported bug: iPhone sends the final twice
+    [webkit([['Hi', 0], ['Hi Dr.', 0], ['Hi Dr. emoji', 0], ['Hi Dr. emoji', 1], ['Hi Dr. emoji', 1]]), 'Hi Dr. emoji'],
+    // iPhone: everything so far, again, after a pause
+    [webkit([['I had a rough day', 1], ['I had a rough day at work.', 1], ['I had a rough day at work.', 1]]), 'I had a rough day at work.'],
+    // iOS 18: pieces restart after a pause, each sent twice
+    [webkit([['I had a rough day', 1], ['I had a rough day', 1], ['at work', 1], ['at work', 1]]), 'I had a rough day at work'],
+    // a later final corrects an earlier word
+    [webkit([['Hi Dr. emoji', 1], ['Hi Dr. Mochi, how are you?', 1]]), 'Hi Dr. Mochi, how are you?'],
+    [webkit([['I had a rough day', 1], ['I had a really rough day at work', 1]]), 'I had a really rough day at work'],
+    [webkit([['I can not sleep at night', 1], ['I cannot sleep at night anymore', 1]]), 'I cannot sleep at night anymore'],
+    // Chrome: separate pieces plus an unfinished part split in two
+    [[R('I had a rough day', 1), R(' at work', 1), R(' and then', 0), R(' my boss', 0)], 'I had a rough day at work and then my boss'],
+    // real repeats stay
+    [[R('I said no', 1), R(' no', 1)], 'I said no no'],
+    [[R('I went to the store', 1), R(' the store was closed', 1)], 'I went to the store the store was closed'],
+    [[R('I am', 1), R(' I was going', 1)], 'I am I was going'],
+    [[R('I feel sad', 1), R(' I want to sleep', 1)], 'I feel sad I want to sleep'],
+    // Android: cumulative and duplicate finals
+    [[R('hello', 1), R('hello how are you', 1)], 'hello how are you'],
+    [[R('hello there', 1), R('hello there', 1)], 'hello there'],
+    // stopped before anything was final
+    [webkit([['I just', 0], ['I just feel', 0]]), 'I just feel'],
+  ];
+  for (const [results, want] of cases) assert.equal(assemble(results), want);
+  assert.equal(mergePiece('', ''), '');
+  assert.equal(fixName('Hi Dr. emoji, how are you', 'Dr. Mochi'), 'Hi Dr. Mochi, how are you');
+  assert.equal(fixName('hi doctor moshi', 'Dr. Mochi'), 'hi Dr. Mochi');
+  assert.equal(fixName('Hi Dr. emoji', 'Sunny'), 'Hi Dr. emoji');
+  assert.equal(fixName('I sent an emoji', 'Dr. Mochi'), 'I sent an emoji');
+});

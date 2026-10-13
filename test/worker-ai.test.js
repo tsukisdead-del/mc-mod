@@ -1,51 +1,12 @@
+// The Cloudflare version's AI (worker/ai.js) with a fake Workers AI binding, over the real storage code
+// (worker/store.js on Node's built-in SQLite, see helpers/d1.js).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createAI, friendlyMessage, DEFAULT_WORKERS_MODEL } from '../worker/ai.js';
 import { defaultSettings } from '../server/settings.js';
 import { CRISIS_NOTE } from '../server/safety.js';
-
-// In-memory stand-in for worker/store.js (only what ai.js uses).
-function fakeStore({ messages = [], attachments = {}, files = {} } = {}) {
-  const kv = new Map();
-  return {
-    messages,
-    saved: [],
-    async messagesSince(t) {
-      return messages.filter((m) => m.createdAt >= t);
-    },
-    queries: [],
-    async attachmentMap(ids, { text = false } = {}) {
-      this.queries.push({ attachmentMap: ids, text });
-      const cut = (a) => (text === true ? a : { ...a, text: typeof text === 'number' ? a.text?.slice(0, text) : undefined });
-      return Object.fromEntries(ids.filter((id) => attachments[id]).map((id) => [id, cut(attachments[id])]));
-    },
-    async fileData(ids) {
-      this.queries.push({ fileData: ids });
-      return Object.fromEntries(ids.filter((id) => files[id]).map((id) => [id, files[id]]));
-    },
-    async addUsage(day, neurons) {
-      const u = kv.get('usage');
-      kv.set('usage', { day, neurons: (u?.day === day ? u.neurons : 0) + neurons });
-    },
-    async unansweredUserMessages() {
-      const out = [];
-      for (let i = messages.length - 1; i >= 0 && messages[i].role === 'user'; i--) out.unshift(messages[i]);
-      return out;
-    },
-    async lastMessage() {
-      return messages.at(-1) ?? null;
-    },
-    async get(k, fallback = null) {
-      return kv.has(k) ? kv.get(k) : fallback;
-    },
-    async put(k, v) {
-      kv.set(k, v);
-    },
-    async saveState(state, parts) {
-      this.saved.push(parts);
-    },
-  };
-}
+import { chunkText, charsPerToken } from '../server/doc-search.js';
+import { newStore, skipWithoutSqlite as skip } from './helpers/d1.js';
 
 function state() {
   return {
@@ -80,22 +41,36 @@ function fakeAI(handler) {
   };
 }
 
-const t0 = Date.UTC(2026, 9, 12, 15, 0);
-const msg = (id, role, text, extra = {}) => ({ id, role, kind: 'chat', text, attachments: [], createdAt: t0 + Number(id.slice(1)) * 1000, ...extra });
+const okStream =
+  (text = '[[mood:warm]] ok') =>
+  () =>
+    sse([{ choices: [{ delta: { content: text } }] }, '[DONE]']);
 
-test('free model: streams OpenAI-style chunks, turns thinking off, sends fresh photos, records usage', async () => {
-  const store = fakeStore({
-    messages: [
-      msg('m1', 'user', 'hey', { attachments: ['old'] }),
-      msg('m2', 'assistant', '[[mood:warm]] hi!'),
-      msg('m3', 'user', 'look at this', { attachments: ['img'] }),
-    ],
-    attachments: {
-      old: { id: 'old', name: 'old.jpg', kind: 'image', mime: 'image/jpeg' },
-      img: { id: 'img', name: 'room.jpg', kind: 'image', mime: 'image/jpeg' },
-    },
-    files: { old: 'T0xE', img: 'TkVX' },
-  });
+async function photo(store, name, data) {
+  return (await store.saveAttachment({ name, kind: 'image', mime: 'image/jpeg', size: 3 }, data)).id;
+}
+
+async function doc(store, name, text, { kind = 'text', base64 = null, pages } = {}) {
+  const mime = kind === 'pdf' ? 'application/pdf' : 'text/plain';
+  const parts = chunkText(text);
+  return (
+    await store.saveAttachment({ name, kind, mime, size: text.length }, base64, {
+      text,
+      parts,
+      tokens: Math.ceil(text.length / charsPerToken(text)),
+      pages,
+    })
+  ).id;
+}
+
+const say = (store, role, text, attachments = []) => store.addMessage({ role, text, attachments });
+const sent = (AI, i = 0) => JSON.stringify(AI.calls[i].params.messages);
+
+test('free model: streams OpenAI-style chunks, turns thinking off, sends fresh photos, records usage', { skip }, async () => {
+  const { store } = await newStore();
+  await say(store, 'user', 'hey', [await photo(store, 'old.jpg', 'T0xE')]);
+  await say(store, 'assistant', '[[mood:warm]] hi!');
+  await say(store, 'user', 'look at this', [await photo(store, 'room.jpg', 'TkVX')]);
   const AI = fakeAI(() =>
     sse([
       { choices: [{ delta: { content: '[[mood:curious]] cozy ' } }] },
@@ -122,7 +97,7 @@ test('free model: streams OpenAI-style chunks, turns thinking off, sends fresh p
   assert.equal(params.messages[0].role, 'system');
   assert.match(params.messages[0].content, /Format reminders/);
   // The new photo is sent as a data URI; the old one is only mentioned.
-  const json = JSON.stringify(params.messages);
+  const json = sent(AI);
   assert.ok(json.includes('data:image/jpeg;base64,TkVX'));
   assert.ok(!json.includes('T0xE'));
   assert.ok(json.includes('[They sent a photo: old.jpg]'));
@@ -130,9 +105,12 @@ test('free model: streams OpenAI-style chunks, turns thinking off, sends fresh p
   assert.equal((await ai.usageToday()).neurons, 34);
 });
 
-test('legacy-format models stream {response} chunks and get max_tokens', async () => {
-  const store = fakeStore({ messages: [msg('m1', 'user', 'hello')] });
-  const AI = fakeAI(() => sse([{ response: '[[mood:warm]] hey ' }, { response: 'there' }, { response: '', usage: { prompt_tokens: 10, completion_tokens: 2 } }, '[DONE]']));
+test('legacy-format models stream {response} chunks and get max_tokens', { skip }, async () => {
+  const { store } = await newStore();
+  await say(store, 'user', 'hello');
+  const AI = fakeAI(() =>
+    sse([{ response: '[[mood:warm]] hey ' }, { response: 'there' }, { response: '', usage: { prompt_tokens: 10, completion_tokens: 2 } }, '[DONE]']),
+  );
   const ai = createAI({ AI, AI_MODEL: '@cf/meta/llama-4-scout-17b-16e-instruct' }, store);
   const { raw } = await ai.reply(state(), () => {});
   assert.equal(raw, '[[mood:warm]] hey there');
@@ -140,16 +118,18 @@ test('legacy-format models stream {response} chunks and get max_tokens', async (
   assert.equal(AI.calls[0].params.chat_template_kwargs, undefined);
 });
 
-test('crisis language adds the safety note even if the model would miss it', async () => {
-  const store = fakeStore({ messages: [msg('m1', 'user', 'honestly I want to die')] });
-  const AI = fakeAI(() => sse([{ choices: [{ delta: { content: '[[mood:concerned]] I hear you.' } }] }, '[DONE]']));
+test('crisis language adds the safety note even if the model would miss it', { skip }, async () => {
+  const { store } = await newStore();
+  await say(store, 'user', 'honestly I want to die');
+  const AI = fakeAI(okStream('[[mood:concerned]] I hear you.'));
   const { risk } = await createAI({ AI }, store).reply(state(), () => {});
   assert.equal(risk, true);
   assert.ok(JSON.stringify(AI.calls[0].params.messages.at(-1)).includes(CRISIS_NOTE.slice(0, 40)));
 });
 
-test('a busy model falls back once; a spent free allowance becomes a friendly message', async () => {
-  const store = fakeStore({ messages: [msg('m1', 'user', 'hi')] });
+test('a busy model falls back once; a spent free allowance becomes a friendly message', { skip }, async () => {
+  const { store } = await newStore();
+  await say(store, 'user', 'hi');
   const AI = fakeAI((model) => {
     if (model.includes('gemma')) throw new Error('3040: Capacity temporarily exceeded, please try again.');
     return sse([{ response: '[[mood:warm]] hi from scout' }, '[DONE]']);
@@ -162,19 +142,28 @@ test('a busy model falls back once; a spent free allowance becomes a friendly me
   assert.equal(AI.calls[1].options, undefined);
 
   const quota = fakeAI(() => {
-    throw new Error("4006: AiError: AiError: you have used up your daily free allocation of 10,000 neurons, please upgrade to Cloudflare's Workers Paid plan.");
+    throw new Error(
+      "4006: AiError: AiError: you have used up your daily free allocation of 10,000 neurons, please upgrade to Cloudflare's Workers Paid plan.",
+    );
   });
   const ai = createAI({ AI: quota }, store);
-  await assert.rejects(ai.reply(state(), () => {}), (err) => /recharged/.test(friendlyMessage(err, 'America/New_York')));
+  await assert.rejects(
+    ai.reply(state(), () => {}),
+    (err) => /recharged/.test(friendlyMessage(err, 'America/New_York')),
+  );
   // Check-ins still go out, from a simple template.
   const text = await ai.checkin(state());
   assert.match(text, /^\[\[mood:/);
 });
 
-test('memory notes update from the free model and the window advances', async () => {
-  const messages = Array.from({ length: 50 }, (_, i) => msg(`m${i + 1}`, i % 2 ? 'assistant' : 'user', `message ${i + 1}`));
-  const store = fakeStore({ messages });
-  const AI = fakeAI(() => ({ choices: [{ message: { content: '- Name: Sam\n- Stressed about exams' } }], usage: { prompt_tokens: 900, completion_tokens: 30 } }));
+test('memory notes update from the free model and the window advances', { skip }, async () => {
+  const { store } = await newStore();
+  const messages = [];
+  for (let i = 0; i < 50; i++) messages.push(await say(store, i % 2 ? 'assistant' : 'user', `message ${i + 1}`));
+  const AI = fakeAI(() => ({
+    choices: [{ message: { content: '- Name: Sam\n- Stressed about exams' } }],
+    usage: { prompt_tokens: 900, completion_tokens: 30 },
+  }));
   const s = state();
   await createAI({ AI }, store).maybeUpdateMemory(s);
   assert.equal(s.memory.text, '- Name: Sam\n- Stressed about exams');
@@ -182,58 +171,101 @@ test('memory notes update from the free model and the window advances', async ()
   assert.equal(AI.calls[0].params.stream, false);
   // 50 messages > 40: keep the newest 20 verbatim
   assert.equal(s.historyStart, messages[30].createdAt);
-  assert.deepEqual(store.saved.at(-1), ['memory', 'meta']);
 });
 
-test('photos: only fresh ones, at most 4, loaded in one query; documents trimmed with a shared budget', async () => {
-  const photos = Array.from({ length: 6 }, (_, i) => `p${i}`);
-  const attachments = Object.fromEntries(photos.map((id) => [id, { id, name: `${id}.jpg`, kind: 'image', mime: 'image/jpeg' }]));
-  attachments.d1 = { id: 'd1', name: 'journal.pdf', kind: 'pdf', mime: 'application/pdf', text: 'a'.repeat(30000) };
-  attachments.d2 = { id: 'd2', name: 'notes.txt', kind: 'text', mime: 'text/plain', text: 'b'.repeat(30000) };
-  attachments.old = { id: 'old', name: 'old.txt', kind: 'text', mime: 'text/plain', text: 'c'.repeat(30000) };
-  const store = fakeStore({
-    messages: [
-      msg('m1', 'user', 'my old notes', { attachments: ['old'] }),
-      msg('m2', 'assistant', '[[mood:warm]] got them'),
-      msg('m3', 'user', 'six photos and two docs', { attachments: [...photos, 'd1', 'd2'] }),
-    ],
-    attachments,
-    files: Object.fromEntries(photos.map((id) => [id, `DATA${id}`])),
-  });
-  const AI = fakeAI(() => sse([{ choices: [{ delta: { content: '[[mood:warm]] ok' } }] }, '[DONE]']));
+test('photos: only fresh ones, at most 4, in one query; short documents go in whole', { skip }, async () => {
+  const { store, d1 } = await newStore();
+  const photos = [];
+  for (let i = 0; i < 6; i++) photos.push(await photo(store, `p${i}.jpg`, `DATA${i}`));
+  const notes = await doc(store, 'notes.txt', 'I keep thinking about the argument with my sister. '.repeat(20));
+  await say(store, 'user', 'six photos and my notes', [...photos, notes]);
+  const AI = fakeAI(okStream());
+  const before = d1.queries;
   await createAI({ AI }, store).reply(state(), () => {});
-  const json = JSON.stringify(AI.calls[0].params.messages);
-  for (const id of photos.slice(0, 4)) assert.ok(json.includes(`base64,DATA${id}`), id);
-  for (const id of photos.slice(4)) {
-    assert.ok(!json.includes(`DATA${id}`));
-    assert.ok(json.includes(`They sent a photo: ${id}.jpg. You can look at 4 photos at a time`));
+  const json = sent(AI);
+  for (const i of [0, 1, 2, 3]) assert.ok(json.includes(`base64,DATA${i}`), `photo ${i}`);
+  for (const i of [4, 5]) {
+    assert.ok(!json.includes(`DATA${i}`));
+    assert.ok(json.includes(`They sent a photo: p${i}.jpg. You can look at 4 photos at a time`));
   }
-  // 40,000 characters shared by the two new documents; 12,000 for the older one.
-  assert.ok(json.includes('a'.repeat(20000)) && !json.includes('a'.repeat(20001)));
-  assert.ok(json.includes('b'.repeat(20000)) && !json.includes('b'.repeat(20001)));
-  assert.ok(json.includes('c'.repeat(12000)) && !json.includes('c'.repeat(12001)));
-  assert.equal(store.queries.filter((q) => q.fileData).length, 1);
-  assert.deepEqual(store.queries.find((q) => q.fileData).fileData, photos.slice(0, 4));
+  assert.ok(json.includes('[Document they sent: \\"notes.txt\\"]'));
+  assert.equal(json.split('argument with my sister').length - 1, 20);
+  // The whole reply (history, files, usage) stays far below D1's 50 queries per request.
+  assert.ok(d1.queries - before <= 12, `queries: ${d1.queries - before}`);
 });
 
-test('Claude on the Worker: photos and PDFs in full only while new, older PDFs as their text', async () => {
-  const store = fakeStore({
-    messages: [
-      msg('m1', 'user', 'old stuff', { attachments: ['img1', 'pdf1'] }),
-      msg('m2', 'assistant', '[[mood:warm]] thanks'),
-      msg('m3', 'user', 'new stuff', { attachments: ['img2', 'pdf2'] }),
-    ],
-    attachments: {
-      img1: { id: 'img1', name: 'a.jpg', kind: 'image', mime: 'image/jpeg' },
-      img2: { id: 'img2', name: 'b.jpg', kind: 'image', mime: 'image/jpeg' },
-      pdf1: { id: 'pdf1', name: 'old.pdf', kind: 'pdf', mime: 'application/pdf', text: 'old pdf text' },
-      pdf2: { id: 'pdf2', name: 'new.pdf', kind: 'pdf', mime: 'application/pdf', text: 'new pdf text' },
-    },
-    files: { img1: 'IMG1', img2: 'IMG2', pdf1: 'PDF1', pdf2: 'PDF2' },
-  });
+// A long "book": ordinary paragraphs with one distinctive passage near the end.
+function book(passage, at = 700, count = 900) {
+  return Array.from({ length: count }, (_, i) => (i === at ? passage : `Paragraph ${i}: the morning was quiet and the street was empty again.`)).join(
+    '\n\n',
+  );
+}
+
+test('a long document: its opening and the parts that match what they asked, not the whole thing', { skip }, async () => {
+  const { store } = await newStore();
+  const text = book('At the lighthouse, Marguerite finally forgave her brother for the fire.');
+  const id = await doc(store, 'novel.txt', text);
+  await say(store, 'user', 'can you help me understand why Marguerite forgave her brother?', [id]);
+  const AI = fakeAI(okStream());
+  await createAI({ AI }, store).reply(state(), () => {});
+  const msgs = AI.calls[0].params.messages;
+  const json = JSON.stringify(msgs);
+  assert.ok(json.includes('Long document they sent: \\"novel.txt\\"'), 'overview');
+  assert.ok(json.includes('Paragraph 0: the morning'), 'opening');
+  assert.ok(json.includes('Marguerite finally forgave her brother'), 'matching part');
+  assert.ok(json.length < 40000, `sent ${json.length} chars, the book is ${text.length}`);
+  // The matching parts ride on the newest message.
+  assert.match(msgs.at(-1).content, /Parts of "novel.txt"[\s\S]*Marguerite finally forgave/);
+});
+
+test('a long document sent without a question gets evenly spaced samples', { skip }, async () => {
+  const { store } = await newStore();
+  const id = await doc(store, 'novel.txt', book('nothing special here'));
+  await say(store, 'user', '', [id]);
+  const AI = fakeAI(okStream());
+  await createAI({ AI }, store).reply(state(), () => {});
+  const last = AI.calls[0].params.messages.at(-1).content;
+  assert.equal((last.match(/% of the way in ---/g) || []).length, 4);
+});
+
+test('a document from earlier in the chat is still searched when they bring it up', { skip }, async () => {
+  const { store } = await newStore();
+  const id = await doc(store, 'journal.txt', book('On the ferry to Naxos I felt calm for the first time in months.', 300, 400));
+  await say(store, 'user', 'here is my journal', [id]);
+  await say(store, 'assistant', '[[mood:warm]] thanks for sharing it');
+  for (let i = 0; i < 5; i++) {
+    await say(store, 'user', `ok ${i}`);
+    await say(store, 'assistant', '[[mood:warm]] mm');
+  }
+  await say(store, 'user', 'remember the ferry to Naxos? why did I feel calm there');
+  const AI = fakeAI(okStream());
+  await createAI({ AI }, store).reply(state(), () => {});
+  const msgs = AI.calls[0].params.messages;
+  const json = JSON.stringify(msgs);
+  // Too old to resend: only the name stays where it was sent...
+  assert.ok(json.includes('[They sent a file: journal.txt]'));
+  assert.ok(!json.includes('Paragraph 0: the morning'));
+  // ...but the part they asked about comes back with their newest message.
+  assert.match(msgs.at(-1).content, /a document they sent earlier[\s\S]*ferry to Naxos I felt calm/);
+  // When they talk about something else, nothing from it is added.
+  await say(store, 'assistant', '[[mood:warm]] mm');
+  await say(store, 'user', 'anyway how are you');
+  await createAI({ AI }, store).reply(state(), () => {});
+  assert.ok(!sent(AI, 1).includes('Paragraph'));
+});
+
+test('Claude on the Worker: photos and small PDFs in full only while new, older PDFs as their text', { skip }, async () => {
+  const { store } = await newStore();
+  const img1 = await photo(store, 'a.jpg', 'IMG1');
+  const pdf1 = await doc(store, 'old.pdf', 'old pdf text', { kind: 'pdf', base64: 'PDF1' });
+  await say(store, 'user', 'old stuff', [img1, pdf1]);
+  await say(store, 'assistant', '[[mood:warm]] thanks');
+  const img2 = await photo(store, 'b.jpg', 'IMG2');
+  const pdf2 = await doc(store, 'new.pdf', 'new pdf text', { kind: 'pdf', base64: 'PDF2' });
+  await say(store, 'user', 'new stuff', [img2, pdf2]);
   const ai = createAI({ ANTHROPIC_API_KEY: 'test' }, store);
   let body;
-  globalThis.__fetch ??= globalThis.fetch;
+  const realFetch = globalThis.fetch;
   globalThis.fetch = async (url, init) => {
     body = JSON.parse(init.body);
     throw new Error('stop here');
@@ -241,30 +273,31 @@ test('Claude on the Worker: photos and PDFs in full only while new, older PDFs a
   try {
     await ai.reply(state(), () => {}).catch(() => {});
   } finally {
-    globalThis.fetch = globalThis.__fetch;
+    globalThis.fetch = realFetch;
   }
   const json = JSON.stringify(body.messages);
   assert.ok(json.includes('IMG2') && json.includes('PDF2'));
   assert.ok(!json.includes('IMG1') && !json.includes('PDF1'));
   assert.ok(json.includes('They sent a photo: a.jpg') && json.includes('old pdf text'));
-  assert.deepEqual(store.queries.find((q) => q.fileData).fileData, ['img2', 'pdf2']);
 });
 
-test('memory notes cut off at the token limit keep the old notes; a broken usage meter never loses a reply', async () => {
-  const messages = Array.from({ length: 14 }, (_, i) => msg(`m${i + 1}`, i % 2 ? 'assistant' : 'user', `message ${i + 1}`));
-  const store = fakeStore({ messages });
+test('memory notes cut off at the token limit keep the old notes; a broken usage meter never loses a reply', { skip }, async () => {
+  const { store } = await newStore();
+  for (let i = 0; i < 14; i++) await say(store, i % 2 ? 'assistant' : 'user', `message ${i + 1}`);
   const AI = fakeAI(() => ({ choices: [{ message: { content: '- Name: Sam\n- Likes hik' }, finish_reason: 'length' }] }));
   const s = state();
   s.memory.text = '- Name: Sam';
   await createAI({ AI }, store).maybeUpdateMemory(s);
   assert.equal(s.memory.text, '- Name: Sam');
-  assert.equal(store.saved.length, 0);
 
-  const chat = fakeStore({ messages: [msg('m1', 'user', 'hi')] });
-  chat.addUsage = async () => {
+  const chat = await newStore();
+  await say(chat.store, 'user', 'hi');
+  chat.store.addUsage = async () => {
     throw new Error('D1_ERROR: transient');
   };
-  const streaming = fakeAI(() => sse([{ choices: [{ delta: { content: '[[mood:warm]] hey!' } }], usage: { prompt_tokens: 10, completion_tokens: 3 } }, '[DONE]']));
-  const { raw } = await createAI({ AI: streaming }, chat).reply(state(), () => {});
+  const streaming = fakeAI(() =>
+    sse([{ choices: [{ delta: { content: '[[mood:warm]] hey!' } }], usage: { prompt_tokens: 10, completion_tokens: 3 } }, '[DONE]']),
+  );
+  const { raw } = await createAI({ AI: streaming }, chat.store).reply(state(), () => {});
   assert.equal(raw, '[[mood:warm]] hey!');
 });

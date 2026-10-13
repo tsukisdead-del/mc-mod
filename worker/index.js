@@ -6,7 +6,7 @@ import QRCode from 'qrcode';
 import { Store, publicMessage } from './store.js';
 import { hasCode, isAuthed, login, clearCookie, sessionId, LOGIN_KEY_PREFIX } from './auth.js';
 import { createAI, friendlyMessage } from './ai.js';
-import { handleUpload } from './files.js';
+import { handleUpload, MAX_UPLOAD_MB } from './files.js';
 import { notifyAll, vapidKeys } from './push.js';
 import { applySettingsPatch, FREQUENCIES } from '../server/settings.js';
 import { scheduleNext, noteActivity, tickAction, HOUR, MAX_UNANSWERED } from '../server/checkins.js';
@@ -258,6 +258,7 @@ async function api(request, env, ctx, url) {
         modelLabel: ai.modelLabel,
         transcribe: ai.canTranscribe,
         photoMaxSide: PHOTO_MAX_SIDE[ai.provider],
+        maxUploadMB: MAX_UPLOAD_MB,
         usage: ai.provider === 'workers-ai' ? await ai.usageToday() : null,
       },
     });
@@ -313,7 +314,9 @@ async function api(request, env, ctx, url) {
     // Without the original (big documents, text files), show the text that was read from it.
     const meta = (await store.attachmentMap([id], { text: !data }))[id];
     if (!meta) return new Response('Not found', { status: 404 });
-    const body = data ? Buffer.from(data, 'base64') : meta.text || '';
+    // Documents are kept in parts (older ones kept all their text with the attachment).
+    const text = data ? '' : meta.chunks ? (await store.documentTexts([id]))[id] || '' : meta.text || '';
+    const body = data ? Buffer.from(data, 'base64') : text;
     return new Response(body, {
       headers: {
         'Content-Type': data ? meta.mime : 'text/plain; charset=utf-8',
