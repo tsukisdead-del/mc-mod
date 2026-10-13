@@ -60,6 +60,11 @@ export async function readStream(stream, onText) {
   return { text, usage, finish };
 }
 
+// Why a non-streamed result stopped ('length' means it was cut off at the token limit).
+export function finishFromResult(result) {
+  return result?.choices?.[0]?.finish_reason || null;
+}
+
 export function textFromResult(result) {
   if (typeof result?.response === 'string') return result.response;
   const content = result?.choices?.[0]?.message?.content;
@@ -99,6 +104,7 @@ export async function readNdjson(stream, onText) {
   let buffer = '';
   let text = '';
   let usage = null;
+  let finish = null;
   const handle = (line) => {
     if (!line.trim()) return;
     const json = JSON.parse(line);
@@ -106,9 +112,12 @@ export async function readNdjson(stream, onText) {
     const piece = json.message?.content || '';
     if (piece) {
       text += piece;
-      onText(piece);
+      onText?.(piece);
     }
-    if (json.done) usage = { prompt_tokens: json.prompt_eval_count, completion_tokens: json.eval_count };
+    if (json.done) {
+      usage = { prompt_tokens: json.prompt_eval_count, completion_tokens: json.eval_count };
+      finish = json.done_reason || null;
+    }
   };
   for (;;) {
     const { value, done } = await reader.read();
@@ -121,5 +130,5 @@ export async function readNdjson(stream, onText) {
     }
   }
   handle(buffer);
-  return { text, usage };
+  return { text, usage, finish };
 }

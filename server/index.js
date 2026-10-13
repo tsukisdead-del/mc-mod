@@ -9,7 +9,7 @@ import { requireAuth, login, logout, isAuthed } from './auth.js';
 import { applySettingsPatch, FREQUENCIES } from './settings.js';
 import { saveUpload, UploadError, attachmentPath, deleteAllAttachments } from './attachments.js';
 import { generateReply, maybeUpdateMemory, friendlyMessage, providerInfo } from './ai.js';
-import { vapidPublicKey, addSubscription, removeSubscription, notifyAll, notifyMessage } from './push.js';
+import { vapidPublicKey, addSubscription, removeSubscription, notifyAll, notifyMessage, deviceCount } from './push.js';
 import { startScheduler, reschedule, noteUserActivity, sendCheckinNow } from './scheduler.js';
 import { buildMobileConfig } from './profile.js';
 import { withLock } from './lock.js';
@@ -138,9 +138,15 @@ api.get('/state', (req, res) => {
     messages: recent.map(publicMessage),
     hasMore: state.messages.length > recent.length,
     memory: { text: state.memory.text, updatedAt: state.memory.updatedAt },
-    push: { publicKey: vapidPublicKey, devices: state.pushSubscriptions.length },
+    push: { publicKey: vapidPublicKey, devices: deviceCount() },
     checkin: checkinStatus(),
-    server: { demo: config.mockAI, hasApiKey: config.hasApiKey || config.mockAI, ...providerInfo() },
+    server: {
+      demo: config.mockAI,
+      hasApiKey: config.hasApiKey || config.mockAI,
+      // Local models work faster with smaller photos.
+      photoMaxSide: config.aiProvider === 'ollama' ? 1024 : undefined,
+      ...providerInfo(),
+    },
   });
 });
 
@@ -193,8 +199,12 @@ api.post('/upload', (req, res) => {
 api.get('/attachments/:id', (req, res) => {
   const meta = state.attachments[req.params.id];
   if (!meta) return res.status(404).end();
+  // A file never changes, but the browser checks back each time so a locked app can't show it from cache.
+  const etag = `"${meta.id}"`;
+  res.setHeader('Cache-Control', 'private, no-cache');
+  res.setHeader('ETag', etag);
+  if (req.headers['if-none-match'] === etag) return res.status(304).end();
   res.setHeader('Content-Type', meta.mime);
-  res.setHeader('Cache-Control', 'private, max-age=31536000, immutable');
   res.setHeader('Content-Security-Policy', 'sandbox');
   res.setHeader('Content-Disposition', `inline; filename*=UTF-8''${encodeURIComponent(meta.name)}`);
   res.sendFile(attachmentPath(meta));
@@ -281,7 +291,7 @@ api.post('/memory/refresh', async (req, res) => {
 api.post('/push/subscribe', (req, res) => {
   try {
     addSubscription(req.body?.subscription, req.get('user-agent'));
-    res.json({ ok: true, devices: state.pushSubscriptions.length });
+    res.json({ ok: true, devices: deviceCount() });
   } catch (e) {
     res.status(400).json({ error: e.message });
   }
@@ -289,7 +299,7 @@ api.post('/push/subscribe', (req, res) => {
 
 api.post('/push/unsubscribe', (req, res) => {
   if (typeof req.body?.endpoint === 'string') removeSubscription(req.body.endpoint);
-  res.json({ ok: true, devices: state.pushSubscriptions.length });
+  res.json({ ok: true, devices: deviceCount() });
 });
 
 api.post('/push/test', async (req, res) => {
@@ -352,11 +362,15 @@ async function checkOllama() {
   try {
     const res = await fetch(`${config.ollamaUrl}/api/tags`);
     const names = ((await res.json()).models || []).map((m) => m.name);
-    const ready = names.some((n) => n === model || n === `${model}:latest` || n.split(':')[0] === model);
+    // A name without a tag means its ":latest" tag; another tag of the same model doesn't count.
+    const ready = names.includes(model.includes(':') ? model : `${model}:latest`);
+    const otherTag = names.find((n) => n.split(':')[0] === model.split(':')[0]);
     console.log(
       ready
         ? `  AI: ${model} running free on this computer with Ollama.`
-        : `  AI: Ollama is running, but the ${model} model isn't downloaded yet. Run:  ollama pull ${model}`,
+        : otherTag
+          ? `  AI: Ollama has ${otherTag}, but the app is set to use ${model}. Set OLLAMA_MODEL=${otherTag} (or run:  ollama pull ${model})`
+          : `  AI: Ollama is running, but the ${model} model isn't downloaded yet. Run:  ollama pull ${model}`,
     );
   } catch {
     console.log(

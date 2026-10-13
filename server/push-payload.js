@@ -21,3 +21,22 @@ export function vapidSubject(configured, origin) {
 // Push messages last 6 hours if the phone is offline. No Topic header: Apple's push service has been
 // rejecting every request that carries one (400 BadWebPushTopic) since September 2026.
 export const PUSH_TTL = 6 * 60 * 60;
+
+// Only real browser push services. A subscription pointing anywhere else would send bits of the chats to
+// that server, so it's refused.
+const PUSH_HOSTS = [
+  /^fcm\.googleapis\.com$/, // Chrome, Edge on Android, Brave, Opera, Samsung Internet
+  /^android\.googleapis\.com$/,
+  /(^|\.)push\.apple\.com$/, // Safari and iPhone/iPad Home Screen apps
+  /^updates\.push\.services\.mozilla\.com$/, // Firefox
+  /(^|\.)notify\.windows\.com$/, // Edge on Windows
+];
+
+export function isPushEndpoint(endpoint) {
+  try {
+    const url = new URL(endpoint);
+    return url.protocol === 'https:' && !url.port && PUSH_HOSTS.some((re) => re.test(url.hostname));
+  } catch {
+    return false;
+  }
+}

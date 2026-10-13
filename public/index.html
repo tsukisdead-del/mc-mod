@@ -31,6 +31,14 @@
           <input id="codeInput" type="password" name="password" autocomplete="current-password" placeholder="Access code" required />
           <button id="loginBtn" type="submit" class="btn-primary">Unlock</button>
         </form>
+        <div id="setupSteps" class="setup-steps" hidden>
+          <ol>
+            <li>In the Cloudflare dashboard, open <b>Workers &amp; Pages</b>, then this app, then <b>Settings</b> › <b>Variables and Secrets</b>.</li>
+            <li>Click <b>Add</b>. Pick the type <b>Secret</b>, name it <code>ACCESS_CODE</code>, and type a code you'll remember (8 or more characters).</li>
+            <li>Click <b>Deploy</b>, then come back here.</li>
+          </ol>
+          <button id="setupDone" type="button" class="btn-primary">I've added it</button>
+        </div>
         <p id="loginError" class="error" role="alert"></p>
       </div>
     </section>
@@ -199,7 +207,7 @@
         <div class="card">
           <h3>Your data</h3>
           <div class="btn-row">
-            <a class="pill" href="/api/export" download="my-chats.json">Download my chats</a>
+            <button id="exportChats" class="pill">Download my chats</button>
             <button id="clearChat" class="pill danger">Delete chat history</button>
             <button id="lockApp" class="pill">Lock app</button>
           </div>

@@ -4,7 +4,8 @@ import webpush from 'web-push';
 import { config } from './config.js';
 import { state, save } from './store.js';
 import { plainText } from '../public/js/reply-format.js';
-import { pushPayload, vapidSubject, PUSH_TTL } from './push-payload.js';
+import { pushPayload, vapidSubject, PUSH_TTL, isPushEndpoint } from './push-payload.js';
+import { sessionId } from './auth.js';
 
 // VAPID keys identify this server to Apple/Google push services. Use env vars if given,
 // otherwise generate a pair once and keep it in the data folder.
@@ -30,15 +31,22 @@ export function addSubscription(sub, userAgent) {
   if (!sub || typeof sub.endpoint !== 'string' || !sub.keys?.p256dh || !sub.keys?.auth) {
     throw new Error('Invalid push subscription');
   }
-  if (!/^https:\/\//.test(sub.endpoint)) throw new Error('Invalid push endpoint');
+  if (!isPushEndpoint(sub.endpoint)) throw new Error("That browser's notification service isn't supported.");
   state.pushSubscriptions = state.pushSubscriptions.filter((s) => s.endpoint !== sub.endpoint);
   state.pushSubscriptions.push({
     endpoint: sub.endpoint,
-    keys: { p256dh: sub.keys.p256dh, auth: sub.keys.auth },
+    keys: { p256dh: String(sub.keys.p256dh), auth: String(sub.keys.auth) },
     userAgent: String(userAgent || '').slice(0, 200),
     createdAt: Date.now(),
+    session: sessionId(),
   });
   save();
+}
+
+// Devices registered under the current access code (the app re-registers itself when it next opens).
+export function deviceCount() {
+  const session = sessionId();
+  return state.pushSubscriptions.filter((s) => s.session === session).length;
 }
 
 export function removeSubscription(endpoint) {
@@ -60,9 +68,15 @@ export async function notifyAll({ title, body, tag = 'mochi' }) {
     urgency: 'normal',
     vapidDetails: { subject: vapidSubject(config.vapidSubject, origin), publicKey: vapid.publicKey, privateKey: vapid.privateKey },
   };
+  const session = sessionId();
+  const current = state.pushSubscriptions.filter((s) => s.session === session);
+  if (current.length < state.pushSubscriptions.length) {
+    state.pushSubscriptions = current;
+    save();
+  }
   let delivered = 0;
   await Promise.all(
-    state.pushSubscriptions.map(async (sub) => {
+    current.map(async (sub) => {
       try {
         await webpush.sendNotification(sub, payload, options);
         delivered++;

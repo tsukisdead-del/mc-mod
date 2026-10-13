@@ -1,7 +1,7 @@
 import { api, streamChat, AuthError } from './api.js';
 import { mountAvatar, face } from './avatar.js';
 import { renderMarkdown } from './markdown.js';
-import { parseReply } from './reply-format.js';
+import { parseReply, plainText } from './reply-format.js';
 import * as voice from './voice.js';
 
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -18,6 +18,7 @@ const S = {
   settings: null,
   frequencies: {},
   messages: [],
+  syncedAt: 0, // newest message time from the server's own list (see poll)
   hasMore: false,
   memory: { text: '' },
   push: {},
@@ -82,16 +83,13 @@ const name = () => S.settings?.therapistName || 'Dr. Mochi';
 
 // ---------- Screens ----------
 
-// setup: the server has no access code yet (free Cloudflare version), so this screen creates one.
-let setupMode = false;
-function showLogin(message = '', { setup = false } = {}) {
-  setupMode = setup;
-  $('#loginHint').textContent = setup
-    ? "First, choose an access code (8+ characters). It keeps your chats private; you'll type it once on each device."
+// needsCode: the server has no access code yet (free Cloudflare version), so explain how to add one.
+function showLogin(message = '', { needsCode = false } = {}) {
+  $('#loginHint').textContent = needsCode
+    ? "One last step: give me an access code so only you can read your chats. You'll type it once on each device."
     : 'Type your access code to unlock your chats.';
-  $('#loginBtn').textContent = setup ? 'Create code' : 'Unlock';
-  $('#codeInput').placeholder = setup ? 'New access code' : 'Access code';
-  $('#codeInput').autocomplete = setup ? 'new-password' : 'current-password';
+  $('#loginForm').hidden = needsCode;
+  $('#setupSteps').hidden = !needsCode;
   $('#boot').hidden = true;
   $('#chat').hidden = true;
   $('#login').hidden = false;
@@ -467,9 +465,11 @@ async function pump({ retry = false } = {}) {
           face.state('idle');
           live.delta(t);
         },
-        done({ message }) {
+        done({ message, catchUp }) {
           finished = true;
           live.finish(message);
+          // The server waited for another reply to finish first; fetch that one too.
+          if (catchUp) setTimeout(poll, 300);
         },
         error({ error }) {
           finished = true;
@@ -507,16 +507,27 @@ async function pump({ retry = false } = {}) {
 }
 
 // Pick up messages that arrived another way: check-ins, replies finished while the app was closed.
+// Asks for everything since the last time we synced (not just since the newest message on screen), so a reply
+// that finished while another one was streaming isn't skipped.
 async function poll() {
   if (S.streaming || document.hidden || $('#chat').hidden) return;
   try {
-    const { messages } = await api(`/messages?after=${lastSavedAt()}`);
-    let newest = null;
-    for (const m of messages) {
-      if (S.messages.some((x) => x.id === m.id)) continue;
-      addToThread(m);
-      if (m.role === 'assistant') newest = m;
+    const { messages } = await api(`/messages?after=${S.syncedAt}`);
+    if (S.streaming) return; // a reply started meanwhile; the next poll gets everything
+    const known = new Set(S.messages.map((x) => x.id));
+    const fresh = messages.filter((m) => !known.has(m.id));
+    if (messages.length) S.syncedAt = messages.at(-1).createdAt;
+    if (!fresh.length) return;
+    if (fresh[0].createdAt < lastSavedAt()) {
+      // Something older than what's on screen: put everything back in order.
+      const local = S.messages.filter((x) => String(x.id).startsWith('local-'));
+      const saved = S.messages.filter((x) => !String(x.id).startsWith('local-'));
+      S.messages = [...saved, ...fresh].sort((a, b) => a.createdAt - b.createdAt).concat(local);
+      renderThread();
+    } else {
+      for (const m of fresh) addToThread(m);
     }
+    const newest = [...fresh].reverse().find((m) => m.role === 'assistant');
     if (newest) face.mood(newest.mood || 'warm');
   } catch (err) {
     if (err instanceof AuthError) showLogin(err.message);
@@ -540,7 +551,8 @@ function loadImageElement(file) {
 
 // Resize big photos (and convert iPhone HEIC) to a JPEG before upload.
 async function shrinkImage(file) {
-  const MAX = 1600;
+  // The free Cloudflare version asks for smaller photos: they're quicker for it to handle.
+  const MAX = S.server.photoMaxSide || 1600;
   let loaded;
   try {
     loaded = await loadImageElement(file);
@@ -733,8 +745,14 @@ function hearingMode() {
   return null;
 }
 
-async function transcribe(wav) {
-  const res = await fetch('/api/transcribe', { method: 'POST', headers: { 'Content-Type': 'audio/wav' }, body: wav, credentials: 'same-origin' });
+async function transcribe(audio) {
+  const res = await fetch('/api/transcribe', {
+    method: 'POST',
+    headers: { 'Content-Type': audio.type || 'audio/wav' },
+    body: audio,
+    credentials: 'same-origin',
+  });
+  if (res.status === 401) throw new AuthError('Please unlock the app again.');
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || "I couldn't make that out. Try again?");
   return data.text || '';
@@ -782,7 +800,9 @@ function startListening() {
       input.focus();
     }
   };
+  let errored = false;
   const failed = (err) => {
+    errored = true;
     stopped();
     const blocked = err === 'not-allowed' || err === 'service-not-allowed' || err === 'network';
     if (mode === 'speech' && blocked && S.server.transcribe && voice.canRecord) {
@@ -793,7 +813,9 @@ function startListening() {
     setVoiceStatus(
       blocked || err === 'no-mic'
         ? 'Microphone access is off. On iPhone: Settings › Privacy & Security › Microphone (and Speech Recognition).'
-        : 'Tap the mic and talk to me',
+        : err === 'decode'
+          ? "I couldn't process that recording. Tap the mic and try again?"
+          : 'Tap the mic and talk to me',
     );
   };
 
@@ -802,7 +824,8 @@ function startListening() {
       onText: (text) => ($('#voiceHeard').textContent = `“${text}”`),
       onEnd: (text) => {
         stopped();
-        heard(text);
+        // Speech recognition always ends after an error; keep the error's message on screen.
+        if (!errored) heard(text);
       },
       onError: failed,
     });
@@ -810,15 +833,20 @@ function startListening() {
   }
   vm.ctl = voice.record({
     onError: failed,
-    onEnd: async (wav) => {
+    onEnd: async (audio) => {
       stopped();
-      if (!wav || !vm.open) return heard('');
+      if (!audio || !vm.open) return heard('');
       vm.transcribing = true;
       setVoiceStatus('Got it, writing that down…');
       try {
-        heard(await transcribe(wav));
+        heard(await transcribe(audio));
       } catch (err) {
-        setVoiceStatus(err.message);
+        if (err instanceof AuthError) {
+          closeVoice();
+          showLogin(err.message);
+        } else {
+          setVoiceStatus(err.message);
+        }
       } finally {
         vm.transcribing = false;
       }
@@ -1115,6 +1143,7 @@ function wireSettings() {
     try {
       await api('/messages', { method: 'DELETE' });
       S.messages = [];
+      S.syncedAt = 0;
       S.hasMore = false;
       renderThread();
       $('#settings').hidden = true;
@@ -1124,10 +1153,57 @@ function wireSettings() {
     }
   });
   $('#lockApp').addEventListener('click', async () => {
+    // Notifications can quote your chats, so a locked device stops getting them too.
+    const sub = await currentSubscription().catch(() => null);
+    if (sub) {
+      await api('/push/unsubscribe', { method: 'POST', body: { endpoint: sub.endpoint } }).catch(() => {});
+      await sub.unsubscribe().catch(() => {});
+    }
     await api('/logout', { method: 'POST' }).catch(() => {});
     $('#settings').hidden = true;
     showLogin();
   });
+  $('#exportChats').addEventListener('click', (e) => exportChats(e.currentTarget));
+}
+
+// Builds the download page by page, so even years of chats never make one big, slow request.
+async function exportChats(btn) {
+  btn.disabled = true;
+  try {
+    const all = [];
+    let before = 0;
+    for (;;) {
+      const { messages, hasMore } = await api(`/messages${before ? `?before=${before}` : ''}`);
+      all.unshift(...messages);
+      if (!hasMore || !messages.length) break;
+      before = messages[0].createdAt;
+    }
+    const out = {
+      exportedAt: new Date().toISOString(),
+      therapist: name(),
+      memory: S.memory?.text || '',
+      messages: all.map((m) => ({
+        at: new Date(m.createdAt).toISOString(),
+        from: m.role === 'user' ? 'me' : name(),
+        checkIn: m.kind === 'checkin' || undefined,
+        text: m.role === 'user' ? m.text : plainText(m.text),
+        files: (m.attachments || []).map((a) => a.name),
+      })),
+    };
+    const url = URL.createObjectURL(new Blob([JSON.stringify(out, null, 2)], { type: 'application/json' }));
+    const a = el('a');
+    a.href = url;
+    a.download = 'my-chats.json';
+    document.body.append(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+  } catch (err) {
+    if (err instanceof AuthError) showLogin(err.message);
+    else toast(`Couldn't download your chats: ${err.message}`);
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 // ---------- Push notifications ----------
@@ -1145,8 +1221,24 @@ function pushSupport() {
 
 async function currentSubscription() {
   if (pushSupport() !== 'ok') return null;
+  const reg = await navigator.serviceWorker.getRegistration();
+  return reg ? reg.pushManager.getSubscription() : null;
+}
+
+// Was this device subscribed with the server's current push key? (It changes if the server's keys change.)
+function sameKey(sub) {
+  const key = sub.options?.applicationServerKey;
+  if (!key || !S.push.publicKey) return true; // can't tell
+  const a = new Uint8Array(key);
+  const b = base64ToBytes(S.push.publicKey);
+  return a.length === b.length && a.every((v, i) => v === b[i]);
+}
+
+async function subscribe(existing) {
+  if (existing && sameKey(existing)) return existing;
+  await existing?.unsubscribe();
   const reg = await navigator.serviceWorker.ready;
-  return reg.pushManager.getSubscription();
+  return reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: base64ToBytes(S.push.publicKey) });
 }
 
 async function refreshNotifUI() {
@@ -1199,8 +1291,7 @@ async function togglePush() {
       if (perm !== 'granted') {
         toast('Notifications were not allowed.');
       } else {
-        const reg = await navigator.serviceWorker.ready;
-        const sub = existing || (await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: base64ToBytes(S.push.publicKey) }));
+        const sub = await subscribe(existing);
         await api('/push/subscribe', { method: 'POST', body: { subscription: sub.toJSON() } });
         toast(`Notifications on! ${name()} can text you now. 💛`);
       }
@@ -1212,14 +1303,16 @@ async function togglePush() {
   renderCheckinInfo();
 }
 
-// Re-register this device with the server in case its list was reset.
+// Re-register this device with the server in case its list was reset (or the access code changed).
 async function syncPushSubscription() {
   try {
     if (pushSupport() !== 'ok' || Notification.permission !== 'granted') return;
-    const sub = await currentSubscription();
-    if (sub) await api('/push/subscribe', { method: 'POST', body: { subscription: sub.toJSON() } });
+    const existing = await currentSubscription();
+    if (!existing) return;
+    const sub = await subscribe(existing);
+    await api('/push/subscribe', { method: 'POST', body: { subscription: sub.toJSON() } });
   } catch {
-    // not critical
+    // not critical; the notifications button shows the real state
   }
 }
 
@@ -1231,6 +1324,7 @@ async function loadState() {
     settings: data.settings,
     frequencies: data.frequencies,
     messages: data.messages,
+    syncedAt: data.messages.at(-1)?.createdAt || 0,
     hasMore: data.hasMore,
     memory: data.memory,
     push: data.push,
@@ -1249,12 +1343,13 @@ async function loadState() {
 }
 
 function wireLogin() {
+  $('#setupDone').addEventListener('click', () => location.reload());
   $('#loginForm').addEventListener('submit', async (e) => {
     e.preventDefault();
     const code = $('#codeInput').value;
     $('#loginError').textContent = '';
     try {
-      await api(setupMode ? '/setup' : '/login', { method: 'POST', body: { code } });
+      await api('/login', { method: 'POST', body: { code } });
       $('#codeInput').value = '';
       await loadState();
       showChat();
@@ -1294,7 +1389,7 @@ async function boot() {
     const me = await api('/me');
     if (!me.authed) {
       for (const n of $$('[data-tname]')) n.textContent = me.name;
-      return showLogin('', { setup: Boolean(me.setup) });
+      return showLogin('', { needsCode: Boolean(me.needsCode) });
     }
     await loadState();
     showChat();

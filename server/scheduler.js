@@ -1,5 +1,5 @@
 import { state, save, addMessage } from './store.js';
-import { scheduleNext, noteActivity, tickAction, HOUR } from './checkins.js';
+import { scheduleNext, noteActivity, tickAction, HOUR, QUIET_AFTER_CHAT } from './checkins.js';
 import { generateCheckin } from './ai.js';
 import { notifyMessage } from './push.js';
 import { parseReply } from '../public/js/reply-format.js';
@@ -24,8 +24,14 @@ export function noteUserActivity() {
   save();
 }
 
+// Returns the check-in message, or null when a scheduled one is no longer wanted.
 export async function sendCheckinNow({ manual = false } = {}) {
   return withLock(async () => {
+    // A scheduled check-in may have waited behind a conversation; don't text first right after they wrote.
+    if (!manual && state.lastUserMessageAt && Date.now() - state.lastUserMessageAt < QUIET_AFTER_CHAT) {
+      reschedule(state.lastUserMessageAt);
+      return null;
+    }
     const raw = await generateCheckin();
     if (!raw) throw new Error('No check-in text was generated');
     const parsed = parseReply(raw);
@@ -39,25 +45,36 @@ export async function sendCheckinNow({ manual = false } = {}) {
   });
 }
 
+let ticking = false;
 async function tick() {
-  const now = Date.now();
-  const action = tickAction({
-    settings: state.settings,
-    checkin: state.checkin,
-    lastUserMessageAt: state.lastUserMessageAt,
-    now,
-  });
-  if (action === 'wait') return;
-  if (action !== 'send') {
-    reschedule(action.reschedule);
-    return;
-  }
+  // Writing a check-in with a local model can take longer than a minute; never start a second one.
+  if (ticking) return;
+  ticking = true;
   try {
-    await sendCheckinNow();
-  } catch (err) {
-    console.error('Check-in failed:', err.message);
-    state.checkin.nextAt = now + HOUR; // try again later
+    const now = Date.now();
+    const action = tickAction({
+      settings: state.settings,
+      checkin: state.checkin,
+      lastUserMessageAt: state.lastUserMessageAt,
+      now,
+    });
+    if (action === 'wait') return;
+    if (action !== 'send') {
+      reschedule(action.reschedule);
+      return;
+    }
+    // Claim the slot before the slow part, so it can't be picked again meanwhile.
+    state.checkin.nextAt = now + HOUR;
     save();
+    try {
+      await sendCheckinNow();
+    } catch (err) {
+      console.error('Check-in failed:', err.message);
+      state.checkin.nextAt = now + HOUR; // try again later
+      save();
+    }
+  } finally {
+    ticking = false;
   }
 }
 

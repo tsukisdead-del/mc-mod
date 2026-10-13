@@ -248,12 +248,13 @@ async function toWav16k(blob, ctx) {
   return wavFromSamples(rendered.getChannelData(0), rate);
 }
 
-// Records until they pause (or stop() is called). onEnd(wavBlob | null). Returns { stop(), abort() }.
+// Records until they pause (or stop() is called). onEnd(blob | null): 16 kHz WAV, or the original recording
+// when the browser can't decode its own format (the server accepts that too). Returns { stop(), abort() }.
 export function record({ onEnd, onError, silenceMs = 1600, maxMs = 60000, onStart }) {
   let stream;
   let recorder;
   let ctx;
-  let raf;
+  let ticker;
   let timer;
   let heard = false;
   let quietSince = 0;
@@ -263,18 +264,27 @@ export function record({ onEnd, onError, silenceMs = 1600, maxMs = 60000, onStar
 
   const stop = () => {
     if (recorder && recorder.state !== 'inactive') recorder.stop();
+    else if (!recorder) finish();
   };
+  const abort = () => {
+    aborted = true;
+    stop();
+  };
+  // Never keep recording (and later send) what's said while they've left the app.
+  const onHidden = () => document.hidden && abort();
 
   const finish = async () => {
     if (done) return;
     done = true;
-    cancelAnimationFrame(raf);
+    clearInterval(ticker);
     clearTimeout(timer);
+    document.removeEventListener('visibilitychange', onHidden);
     stream?.getTracks().forEach((t) => t.stop());
     micSession(false);
     try {
       if (aborted || !heard || !chunks.length) return onEnd(null);
-      onEnd(await toWav16k(new Blob(chunks, { type: recorder.mimeType || 'audio/mp4' }), ctx));
+      const blob = new Blob(chunks, { type: recorder.mimeType || 'audio/mp4' });
+      onEnd(ctx ? await toWav16k(blob, ctx).catch(() => blob) : blob);
     } catch {
       onError?.('decode');
     } finally {
@@ -283,32 +293,61 @@ export function record({ onEnd, onError, silenceMs = 1600, maxMs = 60000, onStar
   };
 
   (async () => {
+    document.addEventListener('visibilitychange', onHidden);
     try {
-      // Create the audio context during the tap (iOS requires a user gesture), then ask for the mic.
-      ctx = new AC();
-      if (ctx.state === 'suspended') await ctx.resume().catch(() => {});
       micSession(true);
+      // Ask for the mic first: iPhone only lets an audio context start during a tap or while the mic is on,
+      // and hands-free listening starts without a tap.
       stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
     } catch (err) {
+      if (done) return;
       done = true;
+      document.removeEventListener('visibilitychange', onHidden);
       micSession(false);
-      ctx?.close().catch(() => {});
       return onError?.(err?.name === 'NotAllowedError' ? 'not-allowed' : 'no-mic');
     }
-    const analyser = ctx.createAnalyser();
-    analyser.fftSize = 1024;
-    ctx.createMediaStreamSource(stream).connect(analyser);
-    recorder = new MediaRecorder(stream);
+    if (done) return stream.getTracks().forEach((t) => t.stop()); // closed while the mic was starting
+
+    let analyser = null;
+    try {
+      ctx = new AC();
+      if (ctx.state !== 'running') await Promise.race([ctx.resume(), new Promise((r) => setTimeout(r, 1500))]).catch(() => {});
+      if (ctx.state === 'running') {
+        analyser = ctx.createAnalyser();
+        // About 85 ms of sound per reading, checked every 80 ms, so nothing between readings is missed.
+        analyser.fftSize = 4096;
+        ctx.createMediaStreamSource(stream).connect(analyser);
+      }
+    } catch {
+      analyser = null; // no pause detection; they tap to stop
+    }
+    if (done) return;
+    try {
+      recorder = new MediaRecorder(stream);
+    } catch {
+      done = true;
+      stream.getTracks().forEach((t) => t.stop());
+      micSession(false);
+      ctx?.close().catch(() => {});
+      return onError?.('no-mic');
+    }
     recorder.ondataavailable = (e) => e.data.size && chunks.push(e.data);
     recorder.onstop = finish;
     recorder.start(250);
     onStart?.();
+    // Without level readings we can't tell when they pause: keep what they record, up to 20 seconds.
+    timer = setTimeout(stop, analyser ? maxMs : Math.min(maxMs, 20000));
+    if (!analyser) {
+      heard = true;
+      return;
+    }
+    // A timer rather than animation frames, which stop while the screen is hidden.
     const samples = new Float32Array(analyser.fftSize);
     const started = performance.now();
-    const loop = () => {
+    ticker = setInterval(() => {
       analyser.getFloatTimeDomainData(samples);
       let sum = 0;
-      for (const s of samples) sum += s * s;
+      for (const v of samples) sum += v * v;
       const loud = Math.sqrt(sum / samples.length) > 0.02;
       const now = performance.now();
       if (loud) {
@@ -316,22 +355,12 @@ export function record({ onEnd, onError, silenceMs = 1600, maxMs = 60000, onStar
         quietSince = 0;
       } else if (heard) {
         quietSince ||= now;
-        if (now - quietSince > silenceMs) return stop();
+        if (now - quietSince > silenceMs) stop();
       } else if (now - started > 9000) {
-        return stop(); // nothing said at all
+        stop(); // nothing said at all
       }
-      raf = requestAnimationFrame(loop);
-    };
-    loop();
-    timer = setTimeout(stop, maxMs);
+    }, 80);
   })();
 
-  return {
-    stop,
-    abort: () => {
-      aborted = true;
-      stop();
-      if (!recorder) finish();
-    },
-  };
+  return { stop, abort };
 }

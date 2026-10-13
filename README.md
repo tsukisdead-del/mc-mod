@@ -58,11 +58,15 @@ Go to [dash.cloudflare.com/sign-up](https://dash.cloudflare.com/sign-up), sign u
 
 From then on, every update to that branch deploys by itself.
 
-### 3. Choose your access code, right away
+### 3. Add your access code
 
-Open your `workers.dev` address. The first screen asks you to **create an access code** (8+ characters); that becomes the password for your chats. Do this as soon as it's deployed, because until a code exists, whoever opens the address first gets to set it.
+The access code is the password for your chats. You set it in Cloudflare, so nobody else can claim the app before you do:
 
-Prefer to set it in Cloudflare instead? Add it before opening the app: **Settings → Variables and Secrets → Add →** type **Secret**, name `ACCESS_CODE`, then **Deploy**.
+1. In the Worker, open **Settings → Variables and Secrets → Add**.
+2. Pick the type **Secret**, name it `ACCESS_CODE`, and type a code you'll remember (8 or more characters; longer is safer).
+3. Click **Deploy**.
+
+Until the code exists, the app only shows these steps. Forgot it? Set a new one the same way; that also logs every device out.
 
 ### 4. Put it on your iPhone and turn on notifications
 
@@ -73,7 +77,8 @@ Same as the Claude version: see [Put it on your iPhone](#4-put-it-on-your-iphone
 - **Daily allowance.** Cloudflare gives every account 10,000 free AI "neurons" a day. That's roughly 250 typical texts with Gemma 4 (fewer if you send lots of photos or long documents). **Settings → Free AI** shows how much is left. If it runs out, Dr. Mochi says it's resting until the reset (midnight UTC), and check-ins still go out as simple messages.
 - **The AI is different.** Gemma 4 is a capable open model, but Claude is noticeably better at nuanced, emotionally intelligent conversation. The same safety rules apply, and the app also watches for crisis words itself, so the help card appears even if the model misses them.
 - **Photos** are looked at when you send them (Dr. Mochi remembers what it saw afterwards, not the photo itself). The app shrinks photos automatically.
-- **Documents.** PDFs and Word files are turned into text for free when you upload them. Very long documents are trimmed to their first ~40,000 characters. Scanned PDFs (pictures of pages) have no text, so send those as photos.
+- **Photos per message.** Dr. Mochi looks at up to 4 photos at a time; if you send more, it asks for the rest separately.
+- **Documents.** PDFs and Word files are turned into text for free when you upload them. Dr. Mochi reads up to ~40,000 characters of new documents per message (shared between them) and keeps a shorter excerpt in mind for the next few messages. Scanned PDFs (pictures of pages) have no text, so send those as photos.
 - **Talking.** Uses your phone's speech recognition when it's available; otherwise the app records you and Cloudflare's free Whisper model writes down what you said.
 - **Privacy.** Your chats are stored in your own Cloudflare D1 database. Cloudflare says Workers AI doesn't use your messages to train models.
 - **Switch to Claude anytime.** Add a Secret named `ANTHROPIC_API_KEY` (see step 1 below) in **Settings → Variables and Secrets**. Hosting stays free; you only pay Anthropic per message.
@@ -200,7 +205,9 @@ In the app, tap the **sliders icon** (top right) → **Check-ins** → **Notific
   - **Claude:** your messages, photos and files go to Anthropic's API. See Anthropic's [privacy policy](https://www.anthropic.com/legal/privacy).
   - **Free Cloudflare version:** they go to Workers AI in your Cloudflare account. Cloudflare says it doesn't use them to train models.
   - **Free local version:** the AI runs on your computer, so they stay there (plus the tunnel you choose for iPhone access).
-- The app is locked behind your access code with an HttpOnly cookie. Changing `ACCESS_CODE` logs every device out.
+- The app is locked behind your access code with an HttpOnly cookie. Wrong guesses are limited (10 per 15 minutes per address). Changing `ACCESS_CODE` logs every device out and stops notifications to them until you unlock them again.
+- **Lock app** (in Settings) logs this device out, turns off its notifications, and clears cached photos and files.
+- Notifications only go to real browser push services (Apple, Google, Mozilla, Microsoft).
 - **Delete chat history** removes all messages and uploaded files from the server. **Erase** (under Memory) wipes the notes.
 
 ## Configuration
@@ -212,8 +219,8 @@ In the app, tap the **sliders icon** (top right) → **Check-ins** → **Notific
 | `DATA_DIR` | | `./data` | Where chats, memory, uploads and push keys live. Use a persistent disk. |
 | `PUBLIC_URL` | | auto | Your https address. Detected automatically on Render and Railway. Used in the iPhone profile and QR code. |
 | `CLAUDE_MODEL` | | `claude-opus-5-5` | Try `claude-sonnet-5-5` or `claude-haiku-5-5` to lower cost. |
-| `CHAT_EFFORT` | | `medium` | `low` replies faster; `high` thinks harder. |
-| `VAPID_PUBLIC_KEY` / `VAPID_PRIVATE_KEY` | | generated | Push notification keys, generated once and saved in `DATA_DIR`. |
+| `CHAT_EFFORT` | | `medium` | `low` replies faster; `high` thinks harder; `none` turns the setting off. |
+| `VAPID_PUBLIC_KEY` / `VAPID_PRIVATE_KEY` | | generated | Push notification keys, generated once and saved in `DATA_DIR`. If you change them later, the app re-registers each device the next time it's opened. |
 | `VAPID_SUBJECT` | | your URL | Contact address push services can use (`mailto:` or https). |
 | `MOCK_AI` | | | Set to `1` for canned replies with no API key (demo/testing). |
 | `OLLAMA_MODEL` | | `gemma4` | Free local mode (used when there's no Claude key): which Ollama model to use. |
@@ -221,7 +228,7 @@ In the app, tap the **sliders icon** (top right) → **Check-ins** → **Notific
 | `OLLAMA_NUM_CTX` | | `16384` | The model's context window in tokens. Lower it on computers with little memory. |
 | `OLLAMA_VISION` | | on | Set to `0` if your model can't see images. |
 
-Cloudflare (free) version: the same names work as **Secrets** or **Variables** on the Worker (`ACCESS_CODE`, `ANTHROPIC_API_KEY`, `CLAUDE_MODEL`, `CHAT_EFFORT`, `PUBLIC_URL`, `VAPID_*`, `MOCK_AI`), plus:
+Cloudflare (free) version: the same names work as **Secrets** or **Variables** on the Worker (`ACCESS_CODE`, which is required there, plus `ANTHROPIC_API_KEY`, `CLAUDE_MODEL`, `CHAT_EFFORT`, `PUBLIC_URL`, `VAPID_*`, `MOCK_AI`), plus:
 
 | Variable | Default | Notes |
 | --- | --- | --- |
@@ -239,7 +246,7 @@ npm run demo          # canned replies, access code "demo" → http://localhost:
 cp .env.example .env  # then set ACCESS_CODE (and ANTHROPIC_API_KEY to use Claude instead of Ollama)
 npm start             # the real thing
 npm test              # unit tests
-npm run cf:demo       # the Cloudflare version locally (canned replies; no account needed) → http://localhost:8787
+npm run cf:demo       # the Cloudflare version locally (canned replies, code "demo"; no account needed) → http://localhost:8787
 ```
 
 To try it on your phone before deploying, expose your computer over https, e.g. `cloudflared tunnel --url http://localhost:3000`, and open the printed address in Safari.

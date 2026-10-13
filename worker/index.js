@@ -4,17 +4,27 @@
 import { Buffer } from 'node:buffer';
 import QRCode from 'qrcode';
 import { Store, publicMessage } from './store.js';
-import { loadAuth, isAuthed, login, setup, clearCookie } from './auth.js';
+import { hasCode, isAuthed, login, clearCookie, sessionId, LOGIN_KEY_PREFIX } from './auth.js';
 import { createAI, friendlyMessage } from './ai.js';
 import { handleUpload } from './files.js';
 import { notifyAll, vapidKeys } from './push.js';
 import { applySettingsPatch, FREQUENCIES } from '../server/settings.js';
 import { scheduleNext, noteActivity, tickAction, HOUR, MAX_UNANSWERED } from '../server/checkins.js';
 import { buildMobileConfig } from '../server/profile.js';
+import { isPushEndpoint } from '../server/push-payload.js';
 import { parseReply, plainText } from '../public/js/reply-format.js';
 
 const encoder = new TextEncoder();
 const PAGE = 120;
+// One reply is written at a time. The lock expires on its own in case a Worker is stopped mid-reply.
+const REPLY_LOCK = 'replying';
+const REPLY_LOCK_MS = 3 * 60 * 1000;
+// How long a second request waits for the first reply to finish (seconds between checks; D1 allows 50 queries).
+const LOCK_WAITS = [1, 2, 3, 4, 5, 5, 5, 5, 5, 5, 5, 5, 5];
+// Photos are resized in the browser to at most this many pixels on the long side before upload.
+const PHOTO_MAX_SIDE = { 'workers-ai': 1024 };
+
+const sleep = (s) => new Promise((r) => setTimeout(r, s * 1000));
 
 const SECURITY_HEADERS = {
   'X-Content-Type-Options': 'nosniff',
@@ -60,17 +70,21 @@ async function readJson(request) {
 // ---------- Check-ins ----------
 
 async function sendCheckin(env, store, state, { manual }) {
-  // Claim the slot first so an overlapping cron run can't send a second one.
-  state.checkin.nextAt = Date.now() + HOUR;
-  await store.saveState(state, ['checkin']);
+  if (!manual) {
+    // Claim the slot first so an overlapping cron run can't send a second one.
+    state.checkin.nextAt = Date.now() + HOUR;
+    await store.saveState(state, ['checkin']);
+  }
   const ai = createAI(env, store);
   const raw = await ai.checkin(state);
   if (!raw) throw new Error('No check-in text was generated');
   const parsed = parseReply(raw);
   const msg = await store.addMessage({ role: 'assistant', kind: 'checkin', text: raw, mood: parsed.mood, crisis: parsed.crisis });
   state.checkin.lastSentAt = msg.createdAt;
-  if (!manual) state.checkin.unanswered++;
-  state.checkin.nextAt = scheduleNext(state.settings, state.checkin, Date.now());
+  if (!manual) {
+    state.checkin.unanswered++;
+    state.checkin.nextAt = scheduleNext(state.settings, state.checkin, Date.now());
+  }
   await store.saveState(state, ['checkin']);
   await notifyAll(env, store, { title: state.settings.therapistName, body: plainText(raw) || 'New message', tag: 'checkin' });
   return msg;
@@ -78,6 +92,7 @@ async function sendCheckin(env, store, state, { manual }) {
 
 async function checkinTick(env) {
   const store = await new Store(env).init();
+  await store.dropExpired(LOGIN_KEY_PREFIX);
   const state = await store.loadState();
   const now = Date.now();
   const action = tickAction({ settings: state.settings, checkin: state.checkin, lastUserMessageAt: state.lastUserMessageAt, now });
@@ -101,7 +116,7 @@ async function checkinTick(env) {
 async function handleChat(request, env, ctx, store) {
   const body = await readJson(request);
   const items = Array.isArray(body?.items) ? body.items.slice(0, 10) : [];
-  const wanted = items.flatMap((it) => (Array.isArray(it?.attachmentIds) ? it.attachmentIds : []));
+  const wanted = items.flatMap((it) => (Array.isArray(it?.attachmentIds) ? it.attachmentIds.slice(0, 10) : []));
   const known = await store.attachmentMap(wanted);
   const clean = [];
   for (const it of items) {
@@ -126,10 +141,10 @@ async function handleChat(request, env, ctx, store) {
   const work = (async () => {
     const ai = createAI(env, store);
     let state;
+    let lock = null;
     try {
       state = await store.loadState();
-      const saved = [];
-      for (const c of clean) saved.push(await store.addMessage({ role: 'user', text: c.text, attachments: c.ids }));
+      const saved = await store.addMessages(clean.map((c) => ({ role: 'user', text: c.text, attachments: c.ids })));
       if (saved.length) {
         const now = Date.now();
         state.lastUserMessageAt = now;
@@ -137,16 +152,31 @@ async function handleChat(request, env, ctx, store) {
         await store.saveState(state, ['checkin', 'meta']);
         await send('saved', { messages: saved.map((m) => publicMessage(m, known)) });
       }
-      const last = await store.lastMessage();
-      if (last?.role !== 'user') {
-        await send('done', { message: null });
+      // Another request is still replying (say they sent more after the app lost its connection): wait for it,
+      // then answer what's still unanswered with that reply in view.
+      lock = await store.lease(REPLY_LOCK, REPLY_LOCK_MS);
+      const waited = !lock;
+      for (const s of LOCK_WAITS) {
+        if (lock) break;
+        await send('typing', {});
+        await sleep(s);
+        lock = await store.lease(REPLY_LOCK, REPLY_LOCK_MS);
+      }
+      if (!lock) {
+        await send('error', { error: "I'm still finishing my last reply. Give me a moment, then tap Try again." });
         return;
       }
+      const last = await store.lastMessage();
+      if (last?.role !== 'user') {
+        await send('done', { message: null, catchUp: waited });
+        return;
+      }
+      if (waited) state = await store.loadState();
       await send('typing', {});
-      const { raw, reset, risk } = await ai.reply(state, (t) => send('delta', { t }));
+      const { raw, reset, risk, answers } = await ai.reply(state, (t) => send('delta', { t }));
       const parsed = parseReply(raw);
-      const reply = await store.addMessage({ role: 'assistant', text: raw, mood: parsed.mood, crisis: parsed.crisis || risk });
-      await send('done', { message: publicMessage(reply, {}), reset: Boolean(reset) });
+      const reply = await store.addMessage({ role: 'assistant', text: raw, mood: parsed.mood, crisis: parsed.crisis || risk }, { after: answers });
+      await send('done', { message: publicMessage(reply, {}), reset: Boolean(reset), catchUp: waited });
       // They closed the app before the reply finished: text them like a normal messaging app would.
       if (!open && state.settings.checkins.replyNotifications) {
         await notifyAll(env, store, { title: state.settings.therapistName, body: plainText(raw), tag: 'reply' });
@@ -155,6 +185,7 @@ async function handleChat(request, env, ctx, store) {
       console.error('Chat failed:', err?.message || err);
       await send('error', { error: friendlyMessage(err, state?.settings.timezone) });
     } finally {
+      if (lock) await store.release(REPLY_LOCK, lock).catch((err) => console.error('Unlock failed:', err?.message || err));
       clearInterval(keepAlive);
       try {
         await writer.close();
@@ -185,29 +216,26 @@ async function api(request, env, ctx, url) {
 
   if (path === '/api/health') return json({ ok: true });
 
-  const auth = await loadAuth(env, store);
   if (path === '/api/me') {
     const settings = (await store.loadState()).settings;
-    return json({ authed: await isAuthed(request, auth), name: settings.therapistName, setup: auth.mode === 'setup' });
+    return json({ authed: await isAuthed(request, env), name: settings.therapistName, needsCode: !hasCode(env) });
   }
   if (path === '/api/login' && method === 'POST') {
-    const r = await login((await readJson(request)).code, auth, store);
+    const r = await login(request, (await readJson(request)).code, env, store);
     return json(r.body, r.status, r.cookie ? { 'Set-Cookie': r.cookie } : {});
   }
-  if (path === '/api/setup' && method === 'POST') {
-    const r = await setup((await readJson(request)).code, auth, store);
-    return json(r.body, r.status, r.cookie ? { 'Set-Cookie': r.cookie } : {});
-  }
-  if (path === '/api/logout' && method === 'POST') return json({ ok: true }, 200, { 'Set-Cookie': clearCookie() });
+  // Also forget cached photos and files, so they can't be reopened from the browser's history.
+  if (path === '/api/logout' && method === 'POST') return json({ ok: true }, 200, { 'Set-Cookie': clearCookie(), 'Clear-Site-Data': '"cache"' });
 
-  if (!(await isAuthed(request, auth))) return json({ error: 'not_logged_in' }, 401);
+  if (!(await isAuthed(request, env))) return json({ error: 'not_logged_in' }, 401);
+  const session = await sessionId(env);
 
   if (path === '/api/state' && method === 'GET') {
     const [state, page, devices, keys] = await Promise.all([
       store.loadState(),
       store.listMessages({ limit: PAGE }),
-      store.countPushSubscriptions(),
-      vapidKeys(store),
+      store.countPushSubscriptions(session),
+      vapidKeys(store, env),
     ]);
     // Remember the app's address so scheduled check-ins can sign push messages with it.
     const origin = appOrigin(request, env);
@@ -229,6 +257,7 @@ async function api(request, env, ctx, url) {
         model: ai.model,
         modelLabel: ai.modelLabel,
         transcribe: ai.canTranscribe,
+        photoMaxSide: PHOTO_MAX_SIDE[ai.provider],
         usage: ai.provider === 'workers-ai' ? await ai.usageToday() : null,
       },
     });
@@ -276,15 +305,19 @@ async function api(request, env, ctx, url) {
   const attachment = path.match(/^\/api\/attachments\/([a-z0-9]+)$/);
   if (attachment && method === 'GET') {
     const id = attachment[1];
-    const meta = (await store.attachmentMap([id], { withText: true }))[id];
-    if (!meta) return new Response('Not found', { status: 404 });
-    const data = await store.fileData(id);
+    // A file never changes, but the browser checks back each time so a locked app can't show it from cache.
+    const etag = `"${id}"`;
+    const cache = { 'Cache-Control': 'private, no-cache', ETag: etag };
+    if (request.headers.get('If-None-Match') === etag) return new Response(null, { status: 304, headers: { ...cache, ...SECURITY_HEADERS } });
+    const data = (await store.fileData([id]))[id];
     // Without the original (big documents, text files), show the text that was read from it.
+    const meta = (await store.attachmentMap([id], { text: !data }))[id];
+    if (!meta) return new Response('Not found', { status: 404 });
     const body = data ? Buffer.from(data, 'base64') : meta.text || '';
     return new Response(body, {
       headers: {
         'Content-Type': data ? meta.mime : 'text/plain; charset=utf-8',
-        'Cache-Control': 'private, max-age=31536000, immutable',
+        ...cache,
         'Content-Disposition': `inline; filename*=UTF-8''${encodeURIComponent(data ? meta.name : `${meta.name}.txt`)}`,
         ...SECURITY_HEADERS,
         'Content-Security-Policy': 'sandbox',
@@ -304,7 +337,7 @@ async function api(request, env, ctx, url) {
       return json({ text: await ai.transcribe(audio, request.headers.get('Content-Type') || '') });
     } catch (err) {
       console.error('Transcription failed:', err?.message || err);
-      return json({ error: friendlyMessage(err) }, 500);
+      return json({ error: friendlyMessage(err, (await store.loadState()).settings.timezone) }, 500);
     }
   }
 
@@ -325,17 +358,18 @@ async function api(request, env, ctx, url) {
 
   if (path === '/api/push/subscribe' && method === 'POST') {
     const sub = (await readJson(request)).subscription;
-    if (!sub || typeof sub.endpoint !== 'string' || !/^https:\/\//.test(sub.endpoint) || !sub.keys?.p256dh || !sub.keys?.auth) {
+    if (!sub || typeof sub.endpoint !== 'string' || typeof sub.keys?.p256dh !== 'string' || typeof sub.keys?.auth !== 'string') {
       return json({ error: 'Invalid push subscription' }, 400);
     }
-    await store.addPushSubscription(sub, request.headers.get('User-Agent'));
-    return json({ ok: true, devices: await store.countPushSubscriptions() });
+    if (!isPushEndpoint(sub.endpoint)) return json({ error: "That browser's notification service isn't supported." }, 400);
+    await store.addPushSubscription(sub, request.headers.get('User-Agent'), session);
+    return json({ ok: true, devices: await store.countPushSubscriptions(session) });
   }
 
   if (path === '/api/push/unsubscribe' && method === 'POST') {
     const { endpoint } = await readJson(request);
     if (typeof endpoint === 'string') await store.removePushSubscription(endpoint);
-    return json({ ok: true, devices: await store.countPushSubscriptions() });
+    return json({ ok: true, devices: await store.countPushSubscriptions(session) });
   }
 
   if (path === '/api/push/test' && method === 'POST') {
@@ -349,32 +383,14 @@ async function api(request, env, ctx, url) {
   }
 
   if (path === '/api/checkin' && method === 'POST') {
+    const state = await store.loadState();
     try {
-      const state = await store.loadState();
       const msg = await sendCheckin(env, store, state, { manual: true });
       return json({ message: publicMessage(msg, {}), checkin: checkinStatus(state) });
     } catch (err) {
       console.error('Manual check-in failed:', err?.message || err);
-      return json({ error: friendlyMessage(err) }, 500);
+      return json({ error: friendlyMessage(err, state.settings.timezone) }, 500);
     }
-  }
-
-  if (path === '/api/export' && method === 'GET') {
-    const [state, messages] = await Promise.all([store.loadState(), store.allMessages()]);
-    const atts = await store.attachmentMap(messages.flatMap((m) => m.attachments));
-    const out = {
-      exportedAt: new Date().toISOString(),
-      therapist: state.settings.therapistName,
-      memory: state.memory.text,
-      messages: messages.map((m) => ({
-        at: new Date(m.createdAt).toISOString(),
-        from: m.role === 'user' ? 'me' : state.settings.therapistName,
-        checkIn: m.kind === 'checkin' || undefined,
-        text: m.role === 'user' ? m.text : plainText(m.text),
-        files: m.attachments.map((id) => atts[id]?.name).filter(Boolean),
-      })),
-    };
-    return json(out, 200, { 'Content-Disposition': 'attachment; filename="my-chats.json"' });
   }
 
   return json({ error: 'not_found' }, 404);

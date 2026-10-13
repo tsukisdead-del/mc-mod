@@ -1,5 +1,5 @@
 // Local test config: same Worker without the Workers AI binding (which needs a Cloudflare account).
-// Run: npx wrangler dev -c test/wrangler.test.jsonc --var MOCK_AI:1 --var ACCESS_CODE:demo
+// Run: npm run cf:demo (canned replies, access code "demo")
 {
   "name": "dr-mochi-test",
   "main": "../worker/index.js",

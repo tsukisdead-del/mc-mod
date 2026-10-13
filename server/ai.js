@@ -12,7 +12,9 @@ import { FORMAT_REMINDER, simpleCheckin, toOllamaMessages, readNdjson } from './
 // the turn they're sent, and trimmed documents, so everything fits in its context window.
 const LOCAL_WINDOW = { max: 40, keep: 20 };
 const LOCAL_DOC_TURNS = 6;
-const LOCAL_DOC_CHARS = 24000;
+// Document characters per request (about 4 per token), shared by the documents being sent: the new ones get
+// most of it, older ones a reminder-sized share.
+const LOCAL_DOC_CHARS = { fresh: 24000, older: 6000 };
 const OLLAMA_DOWN =
   "I can't reach Ollama, the free AI that runs on this computer. Open the Ollama app (or run `ollama serve`) and try again. (Or add an ANTHROPIC_API_KEY to use Claude instead.)";
 
@@ -66,12 +68,31 @@ export function providerInfo() {
 
 let ollamaThinkParam = true;
 
+// Connection problems mean Ollama isn't running; anything else is a real error from Ollama.
+const NOT_RUNNING = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'EHOSTUNREACH', 'ECONNRESET']);
+
+function ollamaProblem(status, detail) {
+  let message = detail;
+  try {
+    message = JSON.parse(detail).error || detail;
+  } catch {
+    // plain text
+  }
+  if (/memory/i.test(message)) {
+    return new FriendlyError(
+      `The ${config.ollamaModel} model needs more memory than this computer has free. Close some apps, or use a smaller model: ollama pull gemma4:e2b, then set OLLAMA_MODEL=gemma4:e2b.`,
+    );
+  }
+  return new FriendlyError(`Ollama had a problem (${status}): ${String(message).slice(0, 200)}`);
+}
+
 // One chat call to Ollama's native API (it lets us size the context window and turn hidden thinking off).
-async function ollamaChat(messages, { stream = false, onText, maxTokens = 700 } = {}) {
+// Always streamed, so a slow computer never hits a timeout waiting for the whole reply. Returns { text, finish }.
+async function ollamaChat(messages, { onText, maxTokens = 700 } = {}) {
   const body = {
     model: config.ollamaModel,
     messages,
-    stream,
+    stream: true,
     keep_alive: '30m',
     options: {
       num_ctx: config.ollamaNumCtx,
@@ -87,23 +108,24 @@ async function ollamaChat(messages, { stream = false, onText, maxTokens = 700 } 
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     });
-  } catch {
-    throw new FriendlyError(OLLAMA_DOWN);
+  } catch (err) {
+    if (NOT_RUNNING.has(err?.cause?.code)) throw new FriendlyError(OLLAMA_DOWN);
+    throw err;
   }
   if (!res.ok) {
     const detail = await res.text().catch(() => '');
     // Some models reject the "think" switch; drop it and try again.
     if (res.status === 400 && ollamaThinkParam && /think/i.test(detail)) {
       ollamaThinkParam = false;
-      return ollamaChat(messages, { stream, onText, maxTokens });
+      return ollamaChat(messages, { onText, maxTokens });
     }
     if (res.status === 404) {
       throw new FriendlyError(`The ${config.ollamaModel} model isn't on this computer yet. In a terminal, run: ollama pull ${config.ollamaModel}`);
     }
-    throw new Error(`Ollama error ${res.status}: ${detail.slice(0, 300)}`);
+    throw ollamaProblem(res.status, detail);
   }
-  if (!stream) return ((await res.json()).message?.content || '').trim();
-  return (await readNdjson(res.body, onText)).text.trim();
+  const { text, finish } = await readNdjson(res.body, onText);
+  return { text: text.trim(), finish };
 }
 
 function localSystem() {
@@ -120,13 +142,15 @@ async function localHistory() {
       recentFiles: LOCAL_DOC_TURNS,
     },
   );
-  return resolveFiles(turns, (ids) =>
-    openModelParts(ids, {
-      fresh,
-      vision: config.ollamaVision,
-      maxChars: LOCAL_DOC_CHARS,
-    }),
-  );
+  // Share the document budget so several long files together still fit the model's context window.
+  const docs = turns
+    .flatMap((t) => t.content.filter((p) => p.type === 'files').flatMap((p) => p.ids))
+    .filter((id) => state.attachments[id] && state.attachments[id].kind !== 'image');
+  const freshDocs = docs.filter((id) => fresh.has(id)).length;
+  const olderDocs = docs.length - freshDocs;
+  const maxChars = (id) =>
+    Math.floor(fresh.has(id) ? LOCAL_DOC_CHARS.fresh / Math.max(freshDocs, 1) : LOCAL_DOC_CHARS.older / Math.max(olderDocs, 1));
+  return resolveFiles(turns, (ids) => openModelParts(ids, { fresh, vision: config.ollamaVision, maxChars }));
 }
 
 // ---------- Claude ----------
@@ -211,11 +235,7 @@ export async function generateReply({ onDelta }) {
     const turns = await localHistory();
     if (turns.at(-1)?.role !== 'user') throw new FriendlyError('There is nothing new to reply to.');
     if (risk) appendUserNote(turns, CRISIS_NOTE);
-    const text = await ollamaChat(toOllamaMessages(localSystem(), turns), {
-      stream: true,
-      onText: onDelta,
-      maxTokens: 700,
-    });
+    const { text } = await ollamaChat(toOllamaMessages(localSystem(), turns), { onText: onDelta, maxTokens: 700 });
     return { raw: text || EMPTY_REPLY, risk };
   }
   const messages = await buildHistory();
@@ -246,11 +266,7 @@ export async function generateCheckin() {
   if (config.aiProvider === 'ollama') {
     try {
       const turns = appendUserNote(await localHistory(), instruction);
-      return (
-        (await ollamaChat(toOllamaMessages(localSystem(), turns), {
-          maxTokens: 300,
-        })) || null
-      );
+      return (await ollamaChat(toOllamaMessages(localSystem(), turns), { maxTokens: 300 })).text || null;
     } catch (err) {
       // Ollama is closed or busy: still check in, with a simple message.
       if (err instanceof FriendlyError) return simpleCheckin();
@@ -287,13 +303,19 @@ export async function maybeUpdateMemory({ force = false } = {}) {
       });
       const prompt = `Current notes:\n${state.memory.text || '(none yet)'}\n\nNewest conversation:\n${convo}`;
       if (config.aiProvider === 'ollama') {
-        notes = await ollamaChat(
+        const { text, finish } = await ollamaChat(
           [
             { role: 'system', content: MEMORY_INSTRUCTIONS },
             { role: 'user', content: prompt },
           ],
           { maxTokens: 600 },
         );
+        // Cut off mid-note: keep the old notes rather than lose their tail; it tries again later.
+        if (finish === 'length') {
+          console.error('Memory notes came back cut off; keeping the old ones.');
+          return;
+        }
+        notes = text;
       } else {
         const final = await getClient()
           .beta.messages.stream(

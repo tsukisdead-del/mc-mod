@@ -407,6 +407,21 @@ a {
   color: var(--danger);
   min-height: 1.4em;
 }
+.setup-steps {
+  text-align: left;
+  margin-top: 14px;
+}
+.setup-steps ol {
+  padding-left: 22px;
+  margin: 0 0 16px;
+  line-height: 1.45;
+}
+.setup-steps li + li {
+  margin-top: 8px;
+}
+.setup-steps .btn-primary {
+  width: 100%;
+}
 
 /* ---------- Chat layout ---------- */
 

@@ -1,7 +1,6 @@
-// Access-code lock for the Cloudflare version.
-// - If the ACCESS_CODE secret is set, it works exactly like the Node server.
-// - Otherwise the first person to open the app chooses the code (stored salted and hashed in D1).
-// Either way a long-lived HttpOnly cookie keeps each device unlocked.
+// Access-code lock for the Cloudflare version. The code is the ACCESS_CODE secret, set in the Cloudflare
+// dashboard (nobody can claim the app before you do); until it exists the app explains how to add it.
+// A long-lived HttpOnly cookie keeps each device unlocked. Changing the code logs every device out.
 
 const COOKIE = 'mochi_session';
 const ONE_YEAR = 365 * 24 * 60 * 60;
@@ -38,21 +37,27 @@ function readCookie(request, name) {
   return null;
 }
 
-export async function loadAuth(env, store) {
-  if (env.ACCESS_CODE) return { mode: 'env', code: env.ACCESS_CODE };
-  const saved = await store.get('auth');
-  return saved ? { mode: 'stored', ...saved } : { mode: 'setup' };
+export function hasCode(env) {
+  return Boolean(String(env.ACCESS_CODE || '').trim());
 }
 
-async function sessionToken(auth) {
-  if (auth.mode === 'env') return hmac(auth.code, 'mochi-session-v1');
-  if (auth.mode === 'stored') return hmac(auth.sessionSecret, 'mochi-session-v1');
-  return null;
+function accessCode(env) {
+  return String(env.ACCESS_CODE || '').trim();
 }
 
-export async function isAuthed(request, auth) {
+async function sessionToken(env) {
+  return hasCode(env) ? hmac(accessCode(env), 'mochi-session-v1') : null;
+}
+
+// Identifies the current login without revealing the cookie; push subscriptions are tagged with it.
+export async function sessionId(env) {
+  const token = await sessionToken(env);
+  return token ? (await sha256(token)).slice(0, 32) : null;
+}
+
+export async function isAuthed(request, env) {
   const token = readCookie(request, COOKIE);
-  const expected = await sessionToken(auth);
+  const expected = await sessionToken(env);
   if (!token || !expected) return false;
   return safeEqual(token, expected);
 }
@@ -65,41 +70,32 @@ export function clearCookie() {
   return `${COOKIE}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax`;
 }
 
-// Global failed-attempt limit (per-IP limits are easy to dodge): 30 wrong codes per 15 minutes.
+// Guessing limits, counted atomically in D1 (each try is counted before the code is checked, and given back
+// when it was right): 10 tries per address and 100 overall per 15 minutes.
 const WINDOW = 15 * 60 * 1000;
-async function tooManyFailures(store) {
-  const f = await store.get('login_failures', { count: 0, resetAt: 0 });
-  return f.resetAt > Date.now() && f.count >= 30;
-}
-async function recordFailure(store) {
-  const now = Date.now();
-  const f = await store.get('login_failures', { count: 0, resetAt: 0 });
-  await store.put('login_failures', f.resetAt > now ? { ...f, count: f.count + 1 } : { count: 1, resetAt: now + WINDOW });
+const PER_ADDRESS = 10;
+const OVERALL = 100;
+export const LOGIN_KEY_PREFIX = 'login:';
+
+// Cloudflare sets CF-Connecting-IP itself, so it can't be faked. IPv6 users usually have a whole /64.
+export function addressBucket(ip) {
+  if (!ip) return 'unknown';
+  if (!ip.includes(':')) return ip;
+  const [head, tail] = ip.toLowerCase().split('::');
+  const h = head ? head.split(':') : [];
+  const t = tail ? tail.split(':') : [];
+  const groups = tail === undefined ? h : [...h, ...Array(Math.max(0, 8 - h.length - t.length)).fill('0'), ...t];
+  return `${groups.slice(0, 4).map((g) => g.replace(/^0+(?=.)/, '')).join(':')}::/64`;
 }
 
 // Returns { status, body, cookie? }.
-export async function login(code, auth, store) {
-  if (auth.mode === 'setup') return { status: 409, body: { error: 'No access code yet. Reload the page to create one.' } };
-  if (await tooManyFailures(store)) return { status: 429, body: { error: 'Too many tries. Wait 15 minutes and try again.' } };
-  const ok =
-    typeof code === 'string' &&
-    code.trim() !== '' &&
-    (auth.mode === 'env' ? await safeEqual(code.trim(), auth.code) : await safeEqual(await sha256(auth.salt + code.trim()), auth.hash));
-  if (!ok) {
-    await recordFailure(store);
-    return { status: 401, body: { error: "That code didn't match." } };
-  }
-  return { status: 200, body: { ok: true }, cookie: sessionCookie(await sessionToken(auth)) };
-}
-
-// First run only: the first visitor picks the access code.
-export async function setup(code, auth, store) {
-  if (auth.mode !== 'setup') return { status: 409, body: { error: 'An access code already exists. Reload to unlock.' } };
-  const clean = typeof code === 'string' ? code.trim() : '';
-  if (clean.length < 8) return { status: 400, body: { error: 'Use at least 8 characters.' } };
-  const salt = toHex(crypto.getRandomValues(new Uint8Array(16)));
-  const record = { salt, hash: await sha256(salt + clean), sessionSecret: toHex(crypto.getRandomValues(new Uint8Array(32))) };
-  // If two people race, only the first insert wins.
-  if (!(await store.putIfAbsent('auth', record))) return { status: 409, body: { error: 'An access code already exists. Reload to unlock.' } };
-  return { status: 200, body: { ok: true }, cookie: sessionCookie(await sessionToken({ mode: 'stored', ...record })) };
+export async function login(request, code, env, store) {
+  if (!hasCode(env)) return { status: 409, body: { error: 'Add the ACCESS_CODE secret in Cloudflare first.' } };
+  const keys = [`${LOGIN_KEY_PREFIX}${addressBucket(request.headers.get('CF-Connecting-IP'))}`, `${LOGIN_KEY_PREFIX}all`];
+  const [mine, all] = await Promise.all(keys.map((k) => store.bump(k, WINDOW)));
+  if (mine > PER_ADDRESS || all > OVERALL) return { status: 429, body: { error: 'Too many tries. Wait 15 minutes and try again.' } };
+  const ok = typeof code === 'string' && code.trim() !== '' && (await safeEqual(code.trim(), accessCode(env)));
+  if (!ok) return { status: 401, body: { error: "That code didn't match." } };
+  await Promise.all(keys.map((k) => store.bump(k, WINDOW, -1)));
+  return { status: 200, body: { ok: true }, cookie: sessionCookie(await sessionToken(env)) };
 }

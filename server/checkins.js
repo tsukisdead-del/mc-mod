@@ -39,8 +39,9 @@ export function noteActivity(checkin, now) {
 // What the periodic tick should do: 'wait', 'send', or { reschedule: fromTime }.
 export function tickAction({ settings, checkin, lastUserMessageAt, now }) {
   const c = settings.checkins;
-  if (!c.enabled) return 'wait';
-  if (!checkin.nextAt) return checkin.unanswered < MAX_UNANSWERED ? { reschedule: now } : 'wait';
+  // Off, or paused until they write back.
+  if (!c.enabled || checkin.unanswered >= MAX_UNANSWERED) return 'wait';
+  if (!checkin.nextAt) return { reschedule: now };
   if (now < checkin.nextAt) return 'wait';
   const talkedRecently = lastUserMessageAt && now - lastUserMessageAt < QUIET_AFTER_CHAT;
   // Server slept through the slot, it's outside their hours, or they're mid-conversation: pick a new time.

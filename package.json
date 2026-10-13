@@ -12,7 +12,7 @@
     "icons": "node scripts/make-icons.mjs",
     "profile": "node scripts/make-profile.mjs",
     "test": "node --test",
-    "cf:demo": "wrangler dev -c test/wrangler.test.jsonc --var MOCK_AI:1",
+    "cf:demo": "wrangler dev -c test/wrangler.test.jsonc --var MOCK_AI:1 --var ACCESS_CODE:demo",
     "cf:deploy": "wrangler deploy"
   },
   "engines": {

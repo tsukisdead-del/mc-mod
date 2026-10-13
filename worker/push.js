@@ -1,5 +1,6 @@
 // Push notifications for the Cloudflare version (see webpush.js for the protocol details).
 import { generateVapidKeys, sendWebPush } from './webpush.js';
+import { sessionId } from './auth.js';
 import { pushPayload, vapidSubject, PUSH_TTL } from '../server/push-payload.js';
 
 // VAPID keys: the VAPID_PUBLIC_KEY/VAPID_PRIVATE_KEY secrets if set, otherwise generated once and kept in D1.
@@ -11,9 +12,14 @@ export async function vapidKeys(store, env = {}) {
   return store.get('vapid'); // re-read: if two requests raced, everyone uses the winner
 }
 
-// Send to every registered device; drops subscriptions the push service says are gone. Returns how many got it.
+// Send to every device registered under the current access code; drops the rest, and the ones the push
+// service says are gone. Returns how many got it.
 export async function notifyAll(env, store, { title, body, tag = 'mochi' }) {
-  const subs = await store.pushSubscriptions();
+  const session = await sessionId(env);
+  if (!session) return 0;
+  const all = await store.pushSubscriptions();
+  const subs = all.filter((s) => s.session === session);
+  if (subs.length < all.length) await store.removeOtherPushSessions(session);
   if (!subs.length) return 0;
   const origin = (env.PUBLIC_URL || (await store.get('origin')) || '').replace(/\/+$/, '');
   const vapid = await vapidKeys(store, env);

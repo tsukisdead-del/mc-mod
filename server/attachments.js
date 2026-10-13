@@ -37,15 +37,17 @@ export async function saveUpload(file) {
   // Local open models can't read PDFs directly, so pull the text out now (and catch scans early).
   if (kind === 'pdf' && config.aiProvider === 'ollama') {
     let text = '';
+    let tooLong = null;
     try {
       text = await pdfText(meta);
-    } catch {
-      // handled below
+    } catch (err) {
+      if (err instanceof UploadError && /too long/.test(err.message)) tooLong = err;
+      // otherwise: unreadable or empty, handled below
     }
-    if (!text.trim()) {
+    if (tooLong || !text.trim()) {
       delete state.attachments[id];
       await fs.promises.rm(path.join(UPLOAD_DIR, fileName), { force: true });
-      throw new UploadError("I couldn't find any text in that PDF (it might be a scan). Send it as a photo instead.");
+      throw tooLong || new UploadError("I couldn't find any text in that PDF (it might be a scan). Send it as a photo instead.");
     }
   }
   save();
@@ -93,8 +95,9 @@ export async function attachmentBlocks(ids) {
 }
 
 // Parts for local open models (Ollama): photos as base64 (only those in `fresh`, the turn being answered,
-// since re-sending old photos costs a lot of context), documents as text.
+// since re-sending old photos costs a lot of context), documents as text. maxChars: a number, or id => number.
 export async function openModelParts(ids, { fresh, vision, maxChars }) {
+  const limit = typeof maxChars === 'function' ? maxChars : () => maxChars;
   const parts = [];
   for (const id of ids || []) {
     const meta = state.attachments[id];
@@ -109,10 +112,11 @@ export async function openModelParts(ids, { fresh, vision, maxChars }) {
         continue;
       }
       const text = meta.kind === 'pdf' ? await pdfText(meta) : await fs.promises.readFile(path.join(UPLOAD_DIR, meta.textFile), 'utf8');
-      const cut = text.length > maxChars;
+      const max = limit(id);
+      const cut = text.length > max;
       parts.push({
         type: 'text',
-        text: `[Document they sent: "${meta.name}"]\n${cut ? text.slice(0, maxChars) : text}${cut ? '\n[Only the first part of this document fit; say so if it matters.]' : ''}`,
+        text: `[Document they sent: "${meta.name}"]\n${cut ? text.slice(0, max) : text}${cut ? '\n[Only the first part of this document fit; say so if it matters.]' : ''}`,
       });
     } catch (err) {
       console.error(`Attachment ${id} could not be read:`, err.message);

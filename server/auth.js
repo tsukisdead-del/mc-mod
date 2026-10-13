@@ -10,6 +10,10 @@ const ONE_YEAR = 365 * 24 * 60 * 60;
 const sessionToken = () =>
   crypto.createHmac('sha256', config.accessCode).update('mochi-session-v1').digest('base64url');
 
+// Identifies the current login without revealing the cookie; push subscriptions are tagged with it, so changing
+// the access code also stops notifications to devices registered under the old one.
+export const sessionId = () => crypto.createHash('sha256').update(sessionToken()).digest('hex').slice(0, 32);
+
 function safeEqual(a, b) {
   const ha = crypto.createHash('sha256').update(String(a)).digest();
   const hb = crypto.createHash('sha256').update(String(b)).digest();
@@ -80,5 +84,7 @@ export function login(req, res) {
 
 export function logout(req, res) {
   res.setHeader('Set-Cookie', `${COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax`);
+  // Also forget cached photos and files, so they can't be reopened from the browser's history.
+  res.setHeader('Clear-Site-Data', '"cache"');
   res.json({ ok: true });
 }

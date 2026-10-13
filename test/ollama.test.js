@@ -8,6 +8,8 @@ import path from 'node:path';
 
 const requests = [];
 let rejectThink = false;
+let ollamaError = null;
+let truncateMemory = false;
 const ollama = http.createServer((req, res) => {
   let body = '';
   req.on('data', (c) => (body += c));
@@ -18,19 +20,21 @@ const ollama = http.createServer((req, res) => {
       res.writeHead(400, { 'Content-Type': 'application/json' }).end(JSON.stringify({ error: '"gemma4" does not support thinking' }));
       return;
     }
+    if (ollamaError) {
+      res.writeHead(500, { 'Content-Type': 'application/json' }).end(JSON.stringify({ error: ollamaError }));
+      return;
+    }
     if (json.model !== 'gemma4') {
       res.writeHead(404, { 'Content-Type': 'application/json' }).end(JSON.stringify({ error: `model "${json.model}" not found, try pulling it first` }));
       return;
     }
-    if (!json.stream) {
-      const content = json.messages[0].content.includes('private notes') ? '- Name: Sam' : '[[mood:warm]] hey, thinking of you!';
-      res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ message: { role: 'assistant', content }, done: true }));
-      return;
-    }
     res.writeHead(200, { 'Content-Type': 'application/x-ndjson' });
-    const pieces = ['[[mood:concerned]] I', "'m here", ' with you.', '\n|||\n', 'Are you safe?'];
+    const memory = json.messages[0].content.includes('private notes');
+    const checkin = json.options.num_predict === 300;
+    const pieces = memory ? ['- Name: ', 'Sam'] : checkin ? ['[[mood:warm]] hey, ', 'thinking of you!'] : ['[[mood:concerned]] I', "'m here", ' with you.', '\n|||\n', 'Are you safe?'];
     for (const p of pieces) res.write(JSON.stringify({ message: { role: 'assistant', content: p }, done: false }) + '\n');
-    res.end(JSON.stringify({ message: { role: 'assistant', content: '' }, done: true, prompt_eval_count: 900, eval_count: 20 }) + '\n');
+    const doneReason = memory && truncateMemory ? 'length' : 'stop';
+    res.end(JSON.stringify({ message: { role: 'assistant', content: '' }, done: true, done_reason: doneReason, prompt_eval_count: 900, eval_count: 20 }) + '\n');
   });
 });
 
@@ -99,10 +103,15 @@ test('models that reject the thinking switch are retried without it', async () =
   assert.ok(!('think' in requests.at(-1)));
 });
 
-test('check-ins and memory notes come from Ollama too', async () => {
+test('check-ins and memory notes come from Ollama too (streamed, so slow computers never time out)', async () => {
   const { ai, store } = mods;
   assert.equal(await ai.generateCheckin(), '[[mood:warm]] hey, thinking of you!');
-  assert.equal(requests.at(-1).stream, false);
+  assert.equal(requests.at(-1).stream, true);
+  // Notes that come back cut off at the token limit don't replace the old ones.
+  truncateMemory = true;
+  await ai.maybeUpdateMemory({ force: true });
+  truncateMemory = false;
+  assert.equal(store.state.memory.text, '');
   await ai.maybeUpdateMemory({ force: true });
   assert.equal(store.state.memory.text, '- Name: Sam');
 });
@@ -126,7 +135,11 @@ test('PDFs are read as text; scans are turned away', async () => {
 test('when Ollama is closed: a clear message, and check-ins still go out', async () => {
   const { ai, store, config } = mods;
   const url = config.ollamaUrl;
-  config.ollamaUrl = 'http://127.0.0.1:9'; // nothing listens here
+  const closed = http.createServer();
+  await new Promise((r) => closed.listen(0, r));
+  const port = closed.address().port;
+  await new Promise((r) => closed.close(r));
+  config.ollamaUrl = `http://127.0.0.1:${port}`; // nothing listens here any more
   store.addMessage({ role: 'user', text: 'hello?' });
   await assert.rejects(ai.generateReply({ onDelta: () => {} }), (err) => /Ollama/.test(ai.friendlyMessage(err)));
   assert.match(await ai.generateCheckin(), /^\[\[mood:/);
@@ -135,4 +148,11 @@ test('when Ollama is closed: a clear message, and check-ins still go out', async
   config.ollamaModel = 'not-downloaded';
   await assert.rejects(ai.generateReply({ onDelta: () => {} }), (err) => /ollama pull not-downloaded/.test(ai.friendlyMessage(err)));
   config.ollamaModel = 'gemma4';
+
+  // Ollama itself failing is reported as such, with a hint when it's out of memory.
+  ollamaError = 'model requires more system memory (9.6 GiB) than is available (5.1 GiB)';
+  await assert.rejects(ai.generateReply({ onDelta: () => {} }), (err) => /smaller model/.test(ai.friendlyMessage(err)));
+  ollamaError = 'something odd';
+  await assert.rejects(ai.generateReply({ onDelta: () => {} }), (err) => /Ollama had a problem \(500\): something odd/.test(ai.friendlyMessage(err)));
+  ollamaError = null;
 });

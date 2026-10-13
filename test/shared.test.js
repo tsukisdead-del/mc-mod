@@ -5,6 +5,8 @@ import { scheduleNext, noteActivity, tickAction, MAX_UNANSWERED, HOUR } from '..
 import { buildTurns, nextHistoryStart } from '../server/history.js';
 import { defaultSettings } from '../server/settings.js';
 import { inWindow } from '../server/time.js';
+import { isPushEndpoint } from '../server/push-payload.js';
+import { addressBucket } from '../worker/auth.js';
 
 test('crisis backstop catches risk language but not figures of speech', () => {
   for (const t of ['I want to die', 'thinking about suicide', "I don't want to be alive anymore", 'i keep cutting myself', 'everyone would be better off without me', 'I might overdose', 'gonna kms... I mean kill myself']) {
@@ -70,4 +72,31 @@ test('history turns alternate roles, mark check-ins, and the window only drops c
   assert.equal(nextHistoryStart(many, 0, 90), 51); // keep the newest 40
   assert.equal(nextHistoryStart(many, 0, 30), 31); // never past what the notes cover
   assert.equal(nextHistoryStart(many.slice(0, 50), 0, 50), 0); // under the limit: unchanged
+});
+
+test('paused check-ins stay paused even with an old time on the books', () => {
+  const settings = { ...defaultSettings(), timezone: 'UTC' };
+  settings.checkins = { ...settings.checkins, enabled: true, startHour: 0, endHour: 0 };
+  const now = Date.UTC(2026, 9, 12, 15);
+  const checkin = { nextAt: now - 60000, lastSentAt: null, unanswered: MAX_UNANSWERED };
+  assert.equal(tickAction({ settings, checkin, lastUserMessageAt: null, now }), 'wait');
+});
+
+test('push subscriptions must point at a real browser push service', () => {
+  assert.ok(isPushEndpoint('https://web.push.apple.com/QGx3abc'));
+  assert.ok(isPushEndpoint('https://fcm.googleapis.com/fcm/send/abc:def'));
+  assert.ok(isPushEndpoint('https://updates.push.services.mozilla.com/wpush/v2/abc'));
+  assert.ok(isPushEndpoint('https://wns2-par02p.notify.windows.com/w/?token=abc'));
+  assert.ok(!isPushEndpoint('https://evil.example/collect'));
+  assert.ok(!isPushEndpoint('https://push.apple.com.evil.example/x'));
+  assert.ok(!isPushEndpoint('http://fcm.googleapis.com/fcm/send/abc'));
+  assert.ok(!isPushEndpoint('https://fcm.googleapis.com:8443/fcm/send/abc'));
+  assert.ok(!isPushEndpoint('not a url'));
+});
+
+test('login limits count IPv6 users by their /64', () => {
+  assert.equal(addressBucket('203.0.113.9'), '203.0.113.9');
+  assert.equal(addressBucket('2001:db8:1:2:3:4:5:6'), addressBucket('2001:0db8:0001:0002:ffff::1'));
+  assert.equal(addressBucket('2001:db8::1'), '2001:db8:0:0::/64');
+  assert.equal(addressBucket(null), 'unknown');
 });
