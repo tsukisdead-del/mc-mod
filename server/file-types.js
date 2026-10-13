@@ -40,7 +40,10 @@ export function cleanName(name) {
 
 // Validates extracted document text.
 export function checkText(text, maxChars = MAX_TEXT_CHARS) {
-  const clean = String(text || '').replace(/\u0000/g, '');
+  // Windows line endings become plain ones, so paragraphs are recognised.
+  const clean = String(text || '')
+    .replace(/\u0000/g, '')
+    .replace(/\r\n?/g, '\n');
   if (!clean.trim()) throw new UploadError('That file looks empty.');
   if (clean.length > maxChars) {
     const pages = Math.round(maxChars / 2500 / 100) * 100;

@@ -6,7 +6,7 @@ import QRCode from 'qrcode';
 import { Store, publicMessage } from './store.js';
 import { hasCode, isAuthed, login, clearCookie, sessionId, LOGIN_KEY_PREFIX } from './auth.js';
 import { createAI, friendlyMessage } from './ai.js';
-import { handleUpload, MAX_UPLOAD_MB } from './files.js';
+import { handleUpload, MAX_UPLOAD_MB, MAX_DOC_CHARS, DOC_ROWS_PREFIX } from './files.js';
 import { notifyAll, vapidKeys } from './push.js';
 import { applySettingsPatch, FREQUENCIES } from '../server/settings.js';
 import { scheduleNext, noteActivity, tickAction, HOUR, MAX_UNANSWERED } from '../server/checkins.js';
@@ -93,6 +93,12 @@ async function sendCheckin(env, store, state, { manual }) {
 async function checkinTick(env) {
   const store = await new Store(env).init();
   await store.dropExpired(LOGIN_KEY_PREFIX);
+  // Once a day (the 04:00 UTC run): tidy up uploads that were never sent, and old daily counters.
+  const at = new Date();
+  if (at.getUTCHours() === 4 && at.getUTCMinutes() < 5) {
+    await store.dropExpired(DOC_ROWS_PREFIX);
+    await store.cleanUp().catch((err) => console.error('Clean-up failed:', err?.message || err));
+  }
   const state = await store.loadState();
   const now = Date.now();
   const action = tickAction({ settings: state.settings, checkin: state.checkin, lastUserMessageAt: state.lastUserMessageAt, now });
@@ -259,6 +265,7 @@ async function api(request, env, ctx, url) {
         transcribe: ai.canTranscribe,
         photoMaxSide: PHOTO_MAX_SIDE[ai.provider],
         maxUploadMB: MAX_UPLOAD_MB,
+        maxDocChars: MAX_DOC_CHARS,
         usage: ai.provider === 'workers-ai' ? await ai.usageToday() : null,
       },
     });
@@ -279,7 +286,8 @@ async function api(request, env, ctx, url) {
     const state = await store.loadState();
     state.historyStart = 0;
     await store.saveState(state, ['meta']);
-    return json({ ok: true });
+    // Also forget photos and files the browser cached.
+    return json({ ok: true }, 200, { 'Clear-Site-Data': '"cache"' });
   }
 
   if (path === '/api/settings' && method === 'PUT') {
@@ -309,7 +317,10 @@ async function api(request, env, ctx, url) {
     // A file never changes, but the browser checks back each time so a locked app can't show it from cache.
     const etag = `"${id}"`;
     const cache = { 'Cache-Control': 'private, no-cache', ETag: etag };
-    if (request.headers.get('If-None-Match') === etag) return new Response(null, { status: 304, headers: { ...cache, ...SECURITY_HEADERS } });
+    if (request.headers.get('If-None-Match') === etag) {
+      if (!(await store.hasAttachment(id))) return new Response('Not found', { status: 404 });
+      return new Response(null, { status: 304, headers: { ...cache, ...SECURITY_HEADERS } });
+    }
     const data = (await store.fileData([id]))[id];
     // Without the original (big documents, text files), show the text that was read from it.
     const meta = (await store.attachmentMap([id], { text: !data }))[id];

@@ -9,7 +9,25 @@ import { buildTurns, resolveFiles, appendUserNote, transcript, nextHistoryStart,
 import { looksLikeCrisis, CRISIS_NOTE } from '../server/safety.js';
 import { mockReplyText, mockCheckinText, mockMemoryText, streamMock } from '../server/mock.js';
 import { filePlaceholder } from '../server/file-types.js';
-import { DOC_BUDGETS, planDocuments, pickParts, queryTerms, ftsQuery, overviewText, excerptText, searchTextFor } from '../server/doc-search.js';
+import {
+  DOC_BUDGETS,
+  planDocuments,
+  pickParts,
+  queryTerms,
+  ftsQuery,
+  overviewText,
+  overviewNote,
+  excerptText,
+  excerptDocument,
+  searchTextFor,
+  refersToDocuments,
+  structuralRefs,
+  chapterForms,
+  relevant,
+  canShowParts,
+  neutralize,
+  clip,
+} from '../server/doc-search.js';
 import { OPENING_CHARS } from './store.js';
 import { FORMAT_REMINDER, simpleCheckin, readStream, textFromResult, finishFromResult, toChatMessages } from '../server/open-models.js';
 
@@ -167,12 +185,18 @@ export function createAI(env, store) {
     const turns = buildTurns(messages, { timezone: state.settings.timezone, filePlaceholder: placeholder, recentFiles: RECENT_DOC_MESSAGES });
     const files = await loadFiles(turns, metas, fresh, search ? searchTextFor(messages) : '');
     await resolveFiles(turns, (ids) => (provider === 'anthropic' ? claudeFiles(ids, files) : openFiles(ids, files)));
+    const last = turns.at(-1);
+    if (last?.role !== 'user') return turns;
+    // Claude: cache everything up to here, so the notes added below (which change every turn) don't stop the
+    // next reply from reusing it.
+    if (provider === 'anthropic' && last.content.length) last.content.at(-1).cache_control = { type: 'ephemeral' };
     // Matching parts of long documents go with their newest message, so earlier turns never change.
-    if (files.excerpts.length && turns.at(-1)?.role === 'user') appendUserNote(turns, files.excerpts.join('\n\n'));
+    if (provider === 'anthropic') last.content.push(...files.excerpts.map((e) => excerptDocument(e)));
+    else if (files.excerpts.length) appendUserNote(turns, files.excerpts.map((e) => excerptText(e)).join('\n\n'));
     return turns;
   }
 
-  // Decides what each file in the conversation becomes and loads it, in about four queries run side by side.
+  // Decides what each file in the conversation becomes and loads it, in about five queries run side by side.
   async function loadFiles(turns, metas, fresh, query) {
     const budget = free ? DOC_BUDGETS.free : DOC_BUDGETS.claude;
     const maxPhotos = free ? MAX_PHOTOS.free : MAX_PHOTOS.claude;
@@ -190,6 +214,7 @@ export function createAI(env, store) {
       .map((m) => ({
         id: m.id,
         meta: m,
+        order: m.createdAt,
         tokens: m.tokens ?? Math.ceil(m.chars / 3.5),
         cpt: m.tokens ? m.chars / m.tokens : 3.5,
         chunks: m.chunks,
@@ -200,54 +225,65 @@ export function createAI(env, store) {
     for (const d of docs) d.mode = plan.get(d.id);
     const inline = docs.filter((d) => d.mode === 'inline');
     const long = docs.filter((d) => d.mode === 'long');
-    const searchable = docs.filter((d) => d.mode !== 'inline' && d.chunks > 0);
+    // Older documents are searched only when their message seems to be about one.
+    const older = docs.filter((d) => d.mode === 'search');
+    const askedAbout = Boolean(query) && refersToDocuments(query, older.map((d) => d.meta.name));
+    const searchable = docs.filter((d) => d.chunks > 0 && (d.mode === 'long' || (d.mode === 'search' && askedAbout)));
     const terms = query ? queryTerms(query) : [];
-    const [data, texts, legacyTexts, openings, matches] = await Promise.all([
+    const words = query ? queryTerms(query, { fold: false }) : [];
+    const { chapters } = structuralRefs(query);
+    const ids = searchable.map((d) => d.id);
+    const chapterMatch = chapters.flatMap((n) => chapterForms(n).map((f) => `"${f}"`)).join(' OR ');
+    const [data, texts, legacyTexts, openings, found, chapterHits] = await Promise.all([
       store.fileData([...photos, ...native]),
       store.documentTexts(inline.filter((d) => d.chunks > 0).map((d) => d.id)),
       // Documents saved by older versions keep all their text with the attachment.
       store.attachmentMap(
-        inline.filter((d) => !d.chunks).map((d) => d.id),
+        docs.filter((d) => !d.chunks && d.mode !== 'search').map((d) => d.id),
         { text: true },
       ),
       store.attachmentMap(
-        long.map((d) => d.id),
+        long.filter((d) => d.chunks).map((d) => d.id),
         { text: OPENING_CHARS },
       ),
-      terms.length && searchable.length
-        ? store.searchDocuments(
-            searchable.map((d) => d.id),
-            ftsQuery(terms),
-            budget.maxParts * 2,
-          )
-        : [],
+      words.length && ids.length ? store.searchDocuments(ids, ftsQuery(words), budget.maxParts * 2) : [],
+      chapterMatch && ids.length ? store.searchDocuments(ids, chapterMatch, 4) : [],
     ]);
-    for (const [id, m] of Object.entries(legacyTexts)) texts[id] = m.text || '';
+    // A chapter they asked for: its heading's part and the next one.
+    const forced = chapterHits.flatMap((h) => [
+      { ...h, forced: true },
+      { docId: h.docId, seq: h.seq + 1, forced: true },
+    ]);
+    const matches = [...forced, ...relevant(found, searchable, terms)];
 
-    // Matching parts first, then samples for long documents that matched little.
     const picked = pickParts({ docs: searchable, matches, budget });
-    const have = new Map(matches.map((m) => [`${m.docId}:${m.seq}`, m.text]));
+    const have = new Map(matches.filter((m) => m.text).map((m) => [`${m.docId}:${m.seq}`, m.text]));
     const missing = [...picked].flatMap(([id, seqs]) => seqs.filter((seq) => !have.has(`${id}:${seq}`)).map((seq) => [id, seq]));
     for (const p of await store.documentParts(missing)) have.set(`${p.docId}:${p.seq}`, p.text);
     const excerpts = searchable
       .filter((d) => picked.get(d.id)?.length)
       .sort((a, b) => Number(b.fresh) - Number(a.fresh))
-      .map((d) =>
-        excerptText({
-          name: d.meta.name,
-          pages: d.meta.pages,
-          chars: d.meta.chars,
-          chunks: d.chunks,
-          older: d.mode === 'search',
-          parts: picked.get(d.id).map((seq) => ({ seq, text: have.get(`${d.id}:${seq}`) || '' })),
-        }),
-      );
+      .map((d) => ({
+        name: d.meta.name,
+        pages: d.meta.pages,
+        chars: d.meta.chars,
+        chunks: d.chunks,
+        older: d.mode === 'search',
+        parts: picked.get(d.id).map((seq) => ({ seq, text: have.get(`${d.id}:${seq}`) || '' })),
+      }));
+    // Openings: a document from an older version (no parts to search) gets as much of its start as would fit.
+    const openingFor = (d) =>
+      d.chunks
+        ? clip(openings[d.id]?.text || '', Math.floor(budget.overview * d.cpt))
+        : clip(legacyTexts[d.id]?.text || '', Math.floor((d.fresh ? budget.inlineFresh : budget.inlineOlder) * d.cpt));
+    for (const d of inline) if (!d.chunks) texts[d.id] = legacyTexts[d.id]?.text || '';
     const hidden = new Set(recentIds.filter((id) => metas[id].kind === 'image' && canSee && fresh.has(id) && !photos.includes(id)));
     return {
       metas,
       data,
       texts,
-      openings: Object.fromEntries(long.map((d) => [d.id, (openings[d.id]?.text || '').slice(0, Math.floor(budget.overview * d.cpt))])),
+      openings: Object.fromEntries(long.map((d) => [d.id, openingFor(d)])),
+      searchable: new Set(long.filter((d) => d.chunks && canShowParts(budget, d.cpt)).map((d) => d.id)),
       plan,
       excerpts,
       canSee,
@@ -256,10 +292,15 @@ export function createAI(env, store) {
     };
   }
 
+  function longNote(id, f) {
+    const m = f.metas[id];
+    return { name: m.name, pages: m.pages, chars: m.chars, opening: f.openings[id] || '', searchable: f.searchable.has(id) };
+  }
+
   function docText(id, f) {
     const m = f.metas[id];
-    if (f.plan.get(id) === 'long') return overviewText({ name: m.name, pages: m.pages, chars: m.chars, opening: f.openings[id] || '' });
-    return `[Document they sent: "${m.name}"]\n${f.texts[id] || ''}`;
+    if (f.plan.get(id) === 'long') return overviewText(longNote(id, f));
+    return `[Document they sent: "${m.name}"]\n${neutralize(f.texts[id] || '')}`;
   }
 
   function photoNote(m, f) {
@@ -284,17 +325,21 @@ export function createAI(env, store) {
     return parts;
   }
 
+  // For Claude, documents go as document blocks: their material, kept apart from the conversation's own text.
   function claudeFiles(ids, f) {
     const blocks = [];
     for (const id of ids) {
       const m = f.metas[id];
       if (!m) continue;
       const data = f.data[id];
-      if (m.kind === 'image')
-        blocks.push(data ? { type: 'image', source: { type: 'base64', media_type: m.mime, data } } : { type: 'text', text: photoNote(m, f) });
-      else if (m.kind === 'pdf' && data)
-        blocks.push({ type: 'document', title: m.name, source: { type: 'base64', media_type: 'application/pdf', data } });
-      else blocks.push({ type: 'text', text: docText(id, f) });
+      if (m.kind === 'image') blocks.push(data ? { type: 'image', source: { type: 'base64', media_type: m.mime, data } } : { type: 'text', text: photoNote(m, f) });
+      else if (m.kind === 'pdf' && data) blocks.push({ type: 'document', title: m.name, source: { type: 'base64', media_type: 'application/pdf', data } });
+      else if (f.plan.get(id) === 'long') {
+        const note = longNote(id, f);
+        blocks.push({ type: 'document', title: m.name, context: overviewNote(note), source: { type: 'text', media_type: 'text/plain', data: note.opening || '(empty)' } });
+      } else {
+        blocks.push({ type: 'document', title: m.name, source: { type: 'text', media_type: 'text/plain', data: f.texts[id] || '(empty)' } });
+      }
     }
     return blocks;
   }

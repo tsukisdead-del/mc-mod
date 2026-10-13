@@ -301,3 +301,69 @@ test('memory notes cut off at the token limit keep the old notes; a broken usage
   const { raw } = await createAI({ AI: streaming }, chat.store).reply(state(), () => {});
   assert.equal(raw, '[[mood:warm]] hey!');
 });
+
+test('everyday messages don\'t pull in passages from an older document', { skip }, async () => {
+  const { store } = await newStore();
+  const id = await doc(store, 'memoir.txt', book('My boss yelled at me and work was hard, and I felt so tired that day.', 300, 400));
+  await say(store, 'user', 'my memoir', [id]);
+  await say(store, 'assistant', '[[mood:warm]] thank you');
+  for (let i = 0; i < 4; i++) {
+    await say(store, 'user', `ok ${i}`);
+    await say(store, 'assistant', '[[mood:warm]] mm');
+  }
+  await say(store, 'user', 'I feel really tired today, my boss yelled at me and work was hard');
+  const AI = fakeAI(okStream());
+  await createAI({ AI }, store).reply(state(), () => {});
+  assert.ok(!sent(AI).includes('Parts of'));
+});
+
+test('they can ask for a chapter', { skip }, async () => {
+  const { store } = await newStore();
+  const chapters = Array.from({ length: 12 }, (_, c) =>
+    [`CHAPTER ${c + 1}`, ...Array.from({ length: 30 }, (_, i) => (c === 7 && i === 0 ? 'Rain fell on the orchard as Ada read the letter.' : `Line ${i} of chapter ${c + 1}, nothing happens.`))].join('\n\n'),
+  );
+  const id = await doc(store, 'novel.txt', chapters.join('\n\n'));
+  await say(store, 'user', 'my favourite novel', [id]);
+  await say(store, 'assistant', '[[mood:warm]] lovely');
+  await say(store, 'user', 'what happens in chapter 8?');
+  const AI = fakeAI(okStream());
+  await createAI({ AI }, store).reply(state(), () => {});
+  assert.match(AI.calls[0].params.messages.at(-1).content, /CHAPTER 8[\s\S]*Ada read the letter/);
+});
+
+test('a long document from the previous version still shows a good part of its start', { skip }, async () => {
+  const { store, db } = await newStore();
+  const text = book('nothing', 0, 900);
+  db.prepare("INSERT INTO attachments (id, created_at, name, kind, mime, size, text) VALUES ('legacy1', 1, 'old.txt', 'text', 'text/plain', 1, ?)").run(text);
+  await say(store, 'user', 'my old notes', ['legacy1']);
+  const AI = fakeAI(okStream());
+  await createAI({ AI }, store).reply(state(), () => {});
+  const json = sent(AI);
+  assert.ok(json.includes('you can only see how it starts'));
+  assert.ok(json.length > 30000, `sent ${json.length}`);
+});
+
+test('Claude gets documents as document blocks, with the cache point before the changing notes', { skip }, async () => {
+  const { store } = await newStore();
+  const id = await doc(store, 'novel.txt', book('At the lighthouse, Marguerite finally forgave her brother.', 4000, 6500));
+  await say(store, 'user', 'why did Marguerite forgive her brother?', [id]);
+  const ai = createAI({ ANTHROPIC_API_KEY: 'test' }, store);
+  let body;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    body = JSON.parse(init.body);
+    throw new Error('stop here');
+  };
+  try {
+    await ai.reply(state(), () => {}).catch(() => {});
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  const last = body.messages.at(-1).content;
+  const overview = last.find((b) => b.type === 'document' && b.title === 'novel.txt');
+  assert.match(overview.context, /Long document they sent/);
+  const excerpt = last.find((b) => b.type === 'document' && b.title === 'Parts of novel.txt');
+  assert.match(excerpt.source.data, /Marguerite finally forgave/);
+  const cached = last.findIndex((b) => b.cache_control);
+  assert.ok(cached >= 0 && cached < last.indexOf(excerpt), 'cache point comes before the excerpts');
+});

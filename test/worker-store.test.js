@@ -29,7 +29,7 @@ test('a database from an older version gets the new columns once', { skip }, asy
     .all()
     .map((c) => c.name);
   for (const c of ['chars', 'tokens', 'chunks', 'pages']) assert.ok(cols.includes(c), c);
-  assert.equal(await store.get('schema_version'), 5);
+  assert.equal(await store.get('schema_version'), 9);
   // A document saved before parts existed still reads: its whole text is with the attachment.
   const old = (await store.attachmentMap(['old1'], { text: true })).old1;
   assert.equal(old.chars, 11);
@@ -37,7 +37,7 @@ test('a database from an older version gets the new columns once', { skip }, asy
   assert.equal(old.text, 'hello there');
   // and a brand-new database is marked up to date too
   const fresh = await newStore();
-  assert.equal(await fresh.store.get('schema_version'), 5);
+  assert.equal(await fresh.store.get('schema_version'), 9);
 });
 
 test('looking up more than 100 attachments at once works (D1 allows 100 bound parameters)', { skip }, async () => {
@@ -155,8 +155,8 @@ test('a long document is stored in parts, searchable, and comes back exactly', {
   const meta = await store.saveAttachment({ name: 'novel.txt', kind: 'text', mime: 'text/plain', size: text.length }, null, docOf(text));
   const parts = chunkText(text);
   assert.ok(parts.length > 10);
-  // one batch per 100 parts, one index fill, one attachment row
-  assert.equal(d1.queries - before, Math.ceil(parts.length / 100) + 2);
+  // one batch per 100 parts (indexed in the same transaction), one attachment row
+  assert.equal(d1.queries - before, Math.ceil(parts.length / 100) + 1);
   const m = (await store.attachmentMap([meta.id]))[meta.id];
   assert.equal(m.chars, text.length);
   assert.equal(m.chunks, parts.length);
@@ -210,4 +210,57 @@ test('a failed upload leaves no parts behind', { skip }, async () => {
   d1.batch = realBatch;
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM doc_chunks').get().n, 0);
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM attachments').get().n, 0);
+});
+
+test('an existing database from the first long-document version is re-indexed for all scripts', { skip }, async () => {
+  const { store, db } = await newStore((db) => {
+    db.exec('CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)');
+    db.exec(`INSERT INTO kv VALUES ('schema_version', '5')`);
+    db.exec('CREATE TABLE doc_chunks (id INTEGER PRIMARY KEY, doc_id TEXT NOT NULL, seq INTEGER NOT NULL, body TEXT NOT NULL)');
+    db.exec("CREATE VIRTUAL TABLE doc_chunks_fts USING fts5(body, content='doc_chunks', content_rowid='id', tokenize='porter unicode61 remove_diacritics 2')");
+    db.exec("INSERT INTO doc_chunks (doc_id, seq, body) VALUES ('old', 0, 'the lighthouse keeper waved')");
+    db.exec('INSERT INTO doc_chunks_fts (rowid, body) SELECT id, body FROM doc_chunks');
+  });
+  assert.equal(await store.get('schema_version'), 9);
+  assert.ok(db.prepare('PRAGMA table_info(doc_chunks)').all().some((c) => c.name === 'search'));
+  assert.equal((await store.searchDocuments(['old'], '"lighthouse"', 5)).length, 1);
+});
+
+test('Japanese and Chinese documents can be searched too', { skip }, async () => {
+  const { store } = await newStore();
+  const { queryTerms, ftsQuery } = await import('../server/doc-search.js');
+  const text = Array.from({ length: 400 }, (_, i) => (i === 300 ? 'マルグリットはついに火事のことで兄を許した。' : `第${i}段落、今日は静かな一日だった。`)).join('\n\n');
+  const meta = await store.saveAttachment({ name: 'novel.txt', kind: 'text', mime: 'text/plain', size: 1 }, null, docOf(text));
+  const hits = await store.searchDocuments([meta.id], ftsQuery(queryTerms('マルグリットはなぜ兄を許したの？', { fold: false })), 3);
+  assert.ok(hits.length && hits[0].text.includes('マルグリット'));
+});
+
+test('search looks only at the documents asked for, even with others stored', { skip }, async () => {
+  const { store } = await newStore();
+  const a = await store.saveAttachment({ name: 'a.txt', kind: 'text', mime: 'text/plain', size: 1 }, null, docOf('the ferry left at dawn. '.repeat(300)));
+  const b = await store.saveAttachment({ name: 'b.txt', kind: 'text', mime: 'text/plain', size: 1 }, null, docOf('the ferry was late again. '.repeat(300)));
+  const hits = await store.searchDocuments([a.id], '"ferry"', 50);
+  assert.ok(hits.length > 0 && hits.every((h) => h.docId === a.id));
+  const both = await store.searchDocuments([a.id, b.id], '"ferry"', 50);
+  assert.ok(both.some((h) => h.docId === b.id) && both.some((h) => h.docId === a.id));
+});
+
+test('the daily tidy-up removes files never sent and parts left by a cut-off upload', { skip }, async () => {
+  const { store, db } = await newStore();
+  const day = 24 * 60 * 60 * 1000;
+  const sent = await store.saveAttachment({ name: 'sent.txt', kind: 'text', mime: 'text/plain', size: 1 }, null, docOf('kept '.repeat(500)));
+  const unsent = await store.saveAttachment({ name: 'unsent.txt', kind: 'text', mime: 'text/plain', size: 1 }, null, docOf('dropped '.repeat(500)));
+  await store.addMessage({ role: 'user', text: 'here', attachments: [sent.id] });
+  // parts of an upload that never finished (its id says it started two hours ago)
+  const orphan = (Date.now() - 2 * 60 * 60 * 1000).toString(36) + 'abcdef0123';
+  db.prepare("INSERT INTO doc_chunks (doc_id, seq, body) VALUES (?, 0, 'orphan text')").run(orphan);
+  db.prepare("INSERT INTO doc_chunks_fts (rowid, body) SELECT id, body FROM doc_chunks WHERE doc_id = ?").run(orphan);
+  // Nothing is old enough yet but the orphan.
+  assert.deepEqual(await store.cleanUp(), [orphan]);
+  const removed = await store.cleanUp(Date.now() + 2 * day);
+  assert.deepEqual(removed, [unsent.id]);
+  assert.ok(await store.hasAttachment(sent.id));
+  assert.equal(await store.hasAttachment(unsent.id), false);
+  assert.deepEqual(await store.searchDocuments([unsent.id, orphan], '"dropped" OR "orphan"', 5), []);
+  assert.equal((await store.searchDocuments([sent.id], '"kept"', 5)).length > 0, true);
 });

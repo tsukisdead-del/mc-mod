@@ -102,10 +102,19 @@ test('login limits count IPv6 users by their /64', () => {
 });
 
 test('Word XML is read as paragraphs, tabs and line breaks', async () => {
-  const { wordXmlText } = await import('../server/attachments.js').catch(() => ({}));
-  if (!wordXmlText) return; // needs the Node server's modules
+  const { wordXmlText } = await import('../server/word-text.js');
   const xml = '<w:body><w:p><w:r><w:t>Dear diary,</w:t></w:r></w:p><w:p><w:r><w:t xml:space="preserve">Today &amp; </w:t><w:tab/><w:t>tomorrow</w:t><w:br/><w:t>&lt;3</w:t></w:r></w:p></w:body>';
   assert.equal(wordXmlText(xml), 'Dear diary,\n\nToday & \ttomorrow\n<3\n\n');
+});
+
+test('splitting a whole book takes milliseconds, whatever its line endings or script', async () => {
+  const { chunkText } = await import('../server/doc-search.js');
+  for (const text of ['no paragraphs at all just words '.repeat(100000), 'Windows line.\r\n'.repeat(200000), '马格丽特终于原谅了她的哥哥'.repeat(230000)]) {
+    const t = performance.now();
+    const parts = chunkText(text);
+    assert.ok(performance.now() - t < 500, `${(performance.now() - t).toFixed(0)} ms`);
+    assert.equal(parts.at(-1)[1], text.length);
+  }
 });
 
 test('document search: parts cover the text, common words are ignored, follow-ups reuse the question', async () => {
@@ -141,10 +150,11 @@ test('speech pieces are joined without the repeats iPhone and Android send', asy
     [webkit([['I had a rough day', 1], ['I had a rough day at work.', 1], ['I had a rough day at work.', 1]]), 'I had a rough day at work.'],
     // iOS 18: pieces restart after a pause, each sent twice
     [webkit([['I had a rough day', 1], ['I had a rough day', 1], ['at work', 1], ['at work', 1]]), 'I had a rough day at work'],
-    // a later final corrects an earlier word
-    [webkit([['Hi Dr. emoji', 1], ['Hi Dr. Mochi, how are you?', 1]]), 'Hi Dr. Mochi, how are you?'],
-    [webkit([['I had a rough day', 1], ['I had a really rough day at work', 1]]), 'I had a really rough day at work'],
-    [webkit([['I can not sleep at night', 1], ['I cannot sleep at night anymore', 1]]), 'I cannot sleep at night anymore'],
+    // Nothing they said is ever dropped: two sentences that start alike both stay (a repeat beats a loss).
+    [[R('I want to kill myself.', 1), R(' I want to tell someone about it.', 1)], 'I want to kill myself. I want to tell someone about it.'],
+    [[R('I feel like giving up', 1), R(' I feel like nobody cares', 1)], 'I feel like giving up I feel like nobody cares'],
+    // a later final that rewrites earlier words keeps both rather than guessing
+    [webkit([['Hi Dr. emoji', 1], ['Hi Dr. Mochi, how are you?', 1]]), 'Hi Dr. emoji Hi Dr. Mochi, how are you?'],
     // Chrome: separate pieces plus an unfinished part split in two
     [[R('I had a rough day', 1), R(' at work', 1), R(' and then', 0), R(' my boss', 0)], 'I had a rough day at work and then my boss'],
     // real repeats stay

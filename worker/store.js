@@ -4,6 +4,10 @@
 // full-text index, so even a book can be searched for the parts that matter. The app state uses the same
 // shape as the Node server's state.json, so shared logic works on both.
 import { withDefaults } from '../server/settings.js';
+import { searchForm, clip } from '../server/doc-search.js';
+
+const FTS_TABLE = `CREATE VIRTUAL TABLE IF NOT EXISTS doc_chunks_fts USING fts5(
+     body, search, content='doc_chunks', content_rowid='id', tokenize='porter unicode61 remove_diacritics 2')`;
 
 const SCHEMA = [
   'CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)',
@@ -18,11 +22,11 @@ const SCHEMA = [
   'CREATE TABLE IF NOT EXISTS files (id TEXT PRIMARY KEY, data TEXT NOT NULL)',
   `CREATE TABLE IF NOT EXISTS push_subscriptions (
      endpoint TEXT PRIMARY KEY, p256dh TEXT NOT NULL, auth TEXT NOT NULL, user_agent TEXT, created_at INTEGER NOT NULL, session TEXT)`,
-  'CREATE TABLE IF NOT EXISTS doc_chunks (id INTEGER PRIMARY KEY, doc_id TEXT NOT NULL, seq INTEGER NOT NULL, body TEXT NOT NULL)',
+  // search: character pairs of any Chinese/Japanese/Korean/Thai text in the part (see doc-search.js searchForm).
+  'CREATE TABLE IF NOT EXISTS doc_chunks (id INTEGER PRIMARY KEY, doc_id TEXT NOT NULL, seq INTEGER NOT NULL, body TEXT NOT NULL, search TEXT)',
   'CREATE INDEX IF NOT EXISTS doc_chunks_by_doc ON doc_chunks (doc_id, seq)',
   // Full-text index over the parts (English stemming, accents ignored). It reads the text from doc_chunks.
-  `CREATE VIRTUAL TABLE IF NOT EXISTS doc_chunks_fts USING fts5(
-     body, content='doc_chunks', content_rowid='id', tokenize='porter unicode61 remove_diacritics 2')`,
+  FTS_TABLE,
 ];
 // Changes for databases made by an older version of this file, applied once (tracked in kv 'schema_version').
 const MIGRATIONS = [
@@ -33,6 +37,11 @@ const MIGRATIONS = [
   'ALTER TABLE attachments ADD COLUMN tokens INTEGER',
   'ALTER TABLE attachments ADD COLUMN chunks INTEGER',
   'ALTER TABLE attachments ADD COLUMN pages INTEGER',
+  // 6-9: also index Chinese/Japanese/Korean/Thai text (as character pairs): rebuild the index with a second column
+  'ALTER TABLE doc_chunks ADD COLUMN search TEXT',
+  'DROP TABLE IF EXISTS doc_chunks_fts',
+  FTS_TABLE,
+  "INSERT INTO doc_chunks_fts (doc_chunks_fts) VALUES ('rebuild')",
 ];
 // Parts per insert batch: keeps each D1 call well under its size limits.
 const CHUNK_BATCH = 100;
@@ -282,16 +291,21 @@ export class Store {
   async saveAttachment({ name, kind, mime, size }, base64, doc = null) {
     const id = Date.now().toString(36) + randomHex(5);
     const meta = { id, name, kind, mime, size, createdAt: Date.now() };
-    let indexed = false;
     try {
       if (doc) {
-        // Parts first, then the search index, then the attachment row: a failure leaves nothing that's used.
-        const insert = this.db.prepare('INSERT INTO doc_chunks (doc_id, seq, body) VALUES (?, ?, ?)');
+        // Parts first, then the attachment row. Each batch indexes its own parts in the same transaction, so
+        // stored parts are always indexed (removing index entries for parts that were never indexed breaks it).
+        const insert = this.db.prepare('INSERT INTO doc_chunks (doc_id, seq, body, search) VALUES (?, ?, ?, ?)');
+        const index = this.db.prepare(
+          'INSERT INTO doc_chunks_fts (rowid, body, search) SELECT id, body, search FROM doc_chunks WHERE doc_id = ? AND seq >= ? AND seq < ?',
+        );
         for (let i = 0; i < doc.parts.length; i += CHUNK_BATCH) {
-          await this.db.batch(doc.parts.slice(i, i + CHUNK_BATCH).map(([a, b], j) => insert.bind(id, i + j, doc.text.slice(a, b))));
+          const batch = doc.parts.slice(i, i + CHUNK_BATCH).map(([a, b], j) => {
+            const body = doc.text.slice(a, b);
+            return insert.bind(id, i + j, body, searchForm(body));
+          });
+          await this.db.batch([...batch, index.bind(id, i, i + CHUNK_BATCH)]);
         }
-        await this.db.prepare('INSERT INTO doc_chunks_fts (rowid, body) SELECT id, body FROM doc_chunks WHERE doc_id = ?').bind(id).run();
-        indexed = true;
       }
       const stmts = [
         this.db
@@ -305,7 +319,7 @@ export class Store {
             kind,
             mime,
             size,
-            doc ? doc.text.slice(0, OPENING_CHARS) : null,
+            doc ? clip(doc.text, OPENING_CHARS) : null,
             doc ? doc.text.length : null,
             doc ? doc.tokens : null,
             doc ? doc.parts.length : null,
@@ -315,14 +329,7 @@ export class Store {
       if (base64) stmts.push(this.db.prepare('INSERT INTO files (id, data) VALUES (?, ?)').bind(id, base64));
       await this.db.batch(stmts);
     } catch (err) {
-      // Search entries may only be removed for parts that were indexed; otherwise the index breaks.
-      if (indexed) await this.deleteDocument(id).catch(() => {});
-      else if (doc)
-        await this.db
-          .prepare('DELETE FROM doc_chunks WHERE doc_id = ?')
-          .bind(id)
-          .run()
-          .catch(() => {});
+      if (doc) await this.deleteDocument(id).catch(() => {});
       throw err;
     }
     return meta;
@@ -331,7 +338,9 @@ export class Store {
   // Removes a document's parts and their search entries.
   async deleteDocument(id) {
     await this.db.batch([
-      this.db.prepare("INSERT INTO doc_chunks_fts (doc_chunks_fts, rowid, body) SELECT 'delete', id, body FROM doc_chunks WHERE doc_id = ?").bind(id),
+      this.db
+        .prepare("INSERT INTO doc_chunks_fts (doc_chunks_fts, rowid, body, search) SELECT 'delete', id, body, search FROM doc_chunks WHERE doc_id = ?")
+        .bind(id),
       this.db.prepare('DELETE FROM doc_chunks WHERE doc_id = ?').bind(id),
     ]);
   }
@@ -352,22 +361,60 @@ export class Store {
   }
 
   // Best-matching parts of these documents for an FTS5 query, best first: [{ docId, seq, text }].
+  // Each document is searched within its own range of rows, so the cost depends only on these documents, not on
+  // everything ever stored.
   async searchDocuments(ids, match, limit) {
-    const unique = uniqueIds(ids);
+    const unique = uniqueIds(ids).slice(0, 20);
     if (!unique.length || !match) return [];
+    const range = (n) => `(SELECT MIN(id) FROM doc_chunks WHERE doc_id = ?${n}) AND (SELECT MAX(id) FROM doc_chunks WHERE doc_id = ?${n})`;
+    const arm = (n) =>
+      `SELECT * FROM (SELECT c.doc_id, c.seq, c.body, f.rank AS r FROM doc_chunks_fts f JOIN doc_chunks c ON c.id = f.rowid
+       WHERE doc_chunks_fts MATCH ?1 AND f.rowid BETWEEN ${range(n)} AND c.doc_id = ?${n} ORDER BY f.rank LIMIT ?${unique.length + 2})`;
+    const sql = `${unique.map((_, i) => arm(i + 2)).join(' UNION ALL ')} ORDER BY r LIMIT ?${unique.length + 2}`;
     try {
       const { results } = await this.db
-        .prepare(
-          `SELECT c.doc_id, c.seq, c.body FROM doc_chunks_fts f JOIN doc_chunks c ON c.id = f.rowid
-           WHERE doc_chunks_fts MATCH ?1 AND c.doc_id IN (SELECT value FROM json_each(?2)) ORDER BY f.rank LIMIT ?3`,
-        )
-        .bind(match, JSON.stringify(unique), limit)
+        .prepare(sql)
+        .bind(match, ...unique, limit)
         .all();
       return results.map((r) => ({ docId: r.doc_id, seq: r.seq, text: r.body }));
     } catch (err) {
       console.error('Document search failed:', err?.message || err);
       return [];
     }
+  }
+
+  // Once a day: remove files that were attached but never sent (older than a day) and parts left behind by an
+  // upload that was cut off (older than an hour). A few at a time, to stay within the free plan's limits.
+  async cleanUp(now = Date.now()) {
+    const removed = [];
+    const { results: unsent } = await this.db
+      .prepare(
+        `SELECT id FROM attachments WHERE created_at < ?
+         AND id NOT IN (SELECT j.value FROM messages, json_each(messages.attachments) j) LIMIT 5`,
+      )
+      .bind(now - 24 * 60 * 60 * 1000)
+      .all();
+    for (const { id } of unsent) {
+      await this.deleteDocument(id);
+      await this.db.batch([this.db.prepare('DELETE FROM files WHERE id = ?').bind(id), this.db.prepare('DELETE FROM attachments WHERE id = ?').bind(id)]);
+      removed.push(id);
+    }
+    const { results: orphans } = await this.db
+      .prepare('SELECT DISTINCT doc_id FROM doc_chunks WHERE seq = 0 AND doc_id NOT IN (SELECT id FROM attachments) LIMIT 5')
+      .all();
+    for (const { doc_id: id } of orphans) {
+      const at = parseInt(id.slice(0, -10), 36); // ids start with their creation time
+      if (Number.isFinite(at) && now - at > 60 * 60 * 1000) {
+        await this.deleteDocument(id);
+        removed.push(id);
+      }
+    }
+    return removed;
+  }
+
+  // Is there such an attachment? (A deleted one must not be answered from the browser's cache.)
+  async hasAttachment(id) {
+    return Boolean(await this.db.prepare('SELECT 1 AS ok FROM attachments WHERE id = ?').bind(id).first());
   }
 
   // Specific parts: pairs of [docId, seq] -> [{ docId, seq, text }].

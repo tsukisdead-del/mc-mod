@@ -12,18 +12,9 @@ export function words(s) {
   );
 }
 
-// Length of the longest common subsequence of two word lists: how much of one appears, in order, in the other.
-function common(a, b) {
-  let prev = new Array(b.length + 1).fill(0);
-  for (let i = 1; i <= a.length; i++) {
-    const row = [0];
-    for (let j = 1; j <= b.length; j++) row[j] = a[i - 1] === b[j - 1] ? prev[j - 1] + 1 : Math.max(prev[j], row[j - 1]);
-    prev = row;
-  }
-  return prev[b.length];
-}
-
-// Adds a newly heard piece to the text so far.
+// Adds a newly heard piece to the text so far. Losing something they said is far worse than repeating a word,
+// so a piece only replaces the text when it starts with exactly the same words (everything so far again, plus
+// more), and is only dropped when it exactly repeats the end of what's there.
 export function mergePiece(acc, piece) {
   const seg = String(piece || '')
     .replace(/\s+/g, ' ')
@@ -33,12 +24,11 @@ export function mergePiece(acc, piece) {
   const a = words(acc);
   const s = words(seg);
   if (!s.length) return acc;
-  // Everything so far again, plus more (recognizers also fix earlier words, so allow some to differ).
-  if (s.length >= a.length && common(a, s.slice(0, a.length + 2)) >= Math.ceil(a.length * 0.6)) return seg;
-  // A repeat of the end of what's already there. (A single repeated word, as in "no, no", is kept.)
-  if (s.length <= a.length && (s.length >= 2 || s.length === a.length) && common(s, a.slice(-(s.length + 1))) >= Math.ceil(s.length * 0.8)) {
-    return acc;
-  }
+  const same = (x, y) => x.length === y.length && x.every((w, i) => w === y[i]);
+  // Everything so far again, plus more.
+  if (s.length >= a.length && same(a, s.slice(0, a.length))) return seg;
+  // An exact repeat of the end of what's already there. (A single repeated word, as in "no, no", is kept.)
+  if (s.length <= a.length && (s.length >= 2 || s.length === a.length) && same(s, a.slice(a.length - s.length))) return acc;
   return `${acc} ${seg}`;
 }
 

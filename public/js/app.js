@@ -593,19 +593,32 @@ async function addPending(file) {
       renderPending();
     } else if (file.size > (S.server.maxUploadMB || 20) * 1024 * 1024) {
       throw new Error(`That file is over ${S.server.maxUploadMB || 20} MB.`);
+    } else if (S.server.maxDocChars && /\.(txt|md|markdown|csv|tsv|json|log|text|html?|xml|ya?ml|rtf)$/i.test(file.name) && file.size > S.server.maxDocChars) {
+      // A text file has about as many characters as bytes: check before sending a whole book that won't fit.
+      if (file.size > S.server.maxDocChars * 4 || (await file.text()).length > S.server.maxDocChars) {
+        throw new Error(`That document is too long for me (I can take about ${Math.round(S.server.maxDocChars / 2500 / 100) * 100} pages). Try sending the part you want me to look at.`);
+      }
     }
     const form = new FormData();
     form.append('file', blob, fileName);
-    const { attachment } = await uploadFile(form, (sent) => {
-      p.progress = sent;
-      showProgress(p);
-    });
+    p.cancel = new AbortController();
+    const { attachment } = await uploadFile(
+      form,
+      (sent) => {
+        p.progress = sent;
+        showProgress(p);
+      },
+      p.cancel.signal,
+    );
     p.attachment = attachment;
     p.status = 'ready';
   } catch (err) {
-    if (err instanceof AuthError) return showLogin(err.message);
-    toast(err.message || 'Upload failed.', 5000);
+    const removed = !S.pending.includes(p);
     S.pending = S.pending.filter((x) => x !== p);
+    renderPending();
+    if (err instanceof AuthError) return showLogin(err.message);
+    if (!err.cancelled && !removed) toast(err.message || 'Upload failed.', 5000);
+    return;
   }
   renderPending();
 }
@@ -638,6 +651,7 @@ function renderPending() {
     const x = el('button', 'p-remove', '×');
     x.setAttribute('aria-label', `Remove ${p.name}`);
     x.addEventListener('click', () => {
+      p.cancel?.abort(); // stop sending it, if it's still on its way
       S.pending = S.pending.filter((y) => y !== p);
       renderPending();
     });
@@ -1154,6 +1168,10 @@ function wireSettings() {
   // Data
   $('#clearChat').addEventListener('click', async () => {
     if (!confirm('Delete your whole chat history, including photos and files? This can’t be undone.')) return;
+    // Files still on their way would otherwise arrive after the delete.
+    for (const p of S.pending) p.cancel?.abort();
+    S.pending = [];
+    renderPending();
     try {
       await api('/messages', { method: 'DELETE' });
       S.messages = [];

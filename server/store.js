@@ -9,7 +9,15 @@ import { withDefaults } from './settings.js';
 const STATE_FILE = path.join(config.dataDir, 'state.json');
 export const UPLOAD_DIR = path.join(config.dataDir, 'uploads');
 
-fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+// Private to this user: chats, photos and documents.
+fs.mkdirSync(UPLOAD_DIR, { recursive: true, mode: 0o700 });
+for (const dir of [config.dataDir, UPLOAD_DIR]) {
+  try {
+    fs.chmodSync(dir, 0o700);
+  } catch {
+    // e.g. a mounted volume that doesn't allow it
+  }
+}
 
 function emptyState() {
   return {
@@ -25,6 +33,9 @@ function emptyState() {
   };
 }
 
+// Set when state.json exists but couldn't be read: nothing may then be cleaned up as if it were unused.
+export let loadError = null;
+
 function load() {
   try {
     const raw = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
@@ -37,7 +48,10 @@ function load() {
       checkin: { ...base.checkin, ...(raw.checkin || {}) },
     };
   } catch (err) {
-    if (err.code !== 'ENOENT') console.error('Could not read state file, starting fresh:', err.message);
+    if (err.code !== 'ENOENT') {
+      loadError = err;
+      console.error('Could not read state file, starting fresh:', err.message);
+    }
     return emptyState();
   }
 }

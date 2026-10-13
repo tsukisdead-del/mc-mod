@@ -223,6 +223,108 @@ test('with Claude, a small PDF goes as itself and a long one as text', async () 
   const blocks = await files.claudeParts([small.id, big.id], f);
   assert.equal(blocks[0].type, 'document');
   assert.equal(blocks[0].source.media_type, 'application/pdf');
-  assert.equal(blocks[1].type, 'text');
-  assert.match(blocks[1].text, /Document they sent: "book.pdf"[\s\S]*Chapter line 149/);
+  // the long one as its text, in a document block of its own
+  assert.equal(blocks[1].type, 'document');
+  assert.equal(blocks[1].title, 'book.pdf');
+  assert.equal(blocks[1].source.type, 'text');
+  assert.match(blocks[1].source.data, /Chapter line 149/);
+});
+
+test('uploads are private to this user, and leftovers from a crash are cleared at startup', async () => {
+  const { files } = mods;
+  const meta = await upload('diary.txt', 'text/plain', Buffer.from('dear diary'));
+  const dir = path.join(dataDir, 'uploads');
+  assert.equal(fs.statSync(path.join(dir, meta.file)).mode & 0o777, 0o600);
+  assert.equal(fs.statSync(path.join(dir, meta.textFile)).mode & 0o777, 0o600);
+  assert.equal(fs.statSync(dir).mode & 0o777, 0o700);
+  fs.writeFileSync(path.join(dir, 'zzz123.pdf'), 'half an upload');
+  files.removeStrayFiles();
+  assert.ok(!fs.existsSync(path.join(dir, 'zzz123.pdf')));
+  assert.ok(fs.existsSync(path.join(dir, meta.file)));
+});
+
+test('a Word file that inflates to something huge is turned away without hurting the server', async () => {
+  const { default: JSZip } = await import('jszip');
+  const zip = new JSZip();
+  zip.file('[Content_Types].xml', '<Types/>');
+  zip.file('word/document.xml', `<w:document><w:body>${'<w:p><w:r><w:t>aaaaaaaaaa</w:t></w:r></w:p>'.repeat(1_200_000)}</w:body></w:document>`);
+  const bomb = await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
+  assert.ok(bomb.length < 2_000_000, `zip is ${bomb.length} bytes`);
+  const t = Date.now();
+  await assert.rejects(upload('bomb.docx', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', bomb), /too long|too big/);
+  assert.ok(Date.now() - t < 60000);
+  // a normal Word file still works
+  const ok = new JSZip();
+  ok.file('[Content_Types].xml', '<Types/>');
+  ok.file('word/document.xml', '<w:document><w:body><w:p><w:r><w:t>Hello from Word</w:t></w:r></w:p></w:body></w:document>');
+  const meta = await upload('letter.docx', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', await ok.generateAsync({ type: 'nodebuffer' }));
+  assert.equal(fs.readFileSync(path.join(dataDir, 'uploads', meta.textFile), 'utf8').trim(), 'Hello from Word');
+});
+
+test('chapters and pages can be asked for; small talk leaves older documents alone', async () => {
+  const { store, ai } = mods;
+  const chapters = Array.from({ length: 12 }, (_, c) =>
+    [`CHAPTER ${c + 1}`, ...Array.from({ length: 30 }, (_, i) => (c === 7 && i === 0 ? 'Rain fell on the orchard as Ada read the letter.' : `Line ${i} of chapter ${c + 1}, nothing happens.`))].join('\n\n'),
+  );
+  const novel = await upload('novel.txt', 'text/plain', Buffer.from(chapters.join('\n\n')));
+  store.addMessage({ role: 'user', text: 'my favourite novel', attachments: [novel.id] });
+  store.addMessage({ role: 'assistant', text: '[[mood:warm]] lovely' });
+  store.addMessage({ role: 'user', text: 'what happens in chapter 8?' });
+  await ai.generateReply({ onDelta: () => {} });
+  assert.match(requests.at(-1).messages.at(-1).content, /CHAPTER 8[\s\S]*Ada read the letter/);
+  store.addMessage({ role: 'assistant', text: '[[mood:warm]] it rains' });
+  for (let i = 0; i < 4; i++) {
+    store.addMessage({ role: 'user', text: `ok ${i}` });
+    store.addMessage({ role: 'assistant', text: '[[mood:warm]] mm' });
+  }
+  store.addMessage({ role: 'user', text: 'I feel tired today, nothing happens at work and my boss yelled' });
+  await ai.generateReply({ onDelta: () => {} });
+  assert.doesNotMatch(requests.at(-1).messages.at(-1).content, /Parts of/);
+});
+
+test('a document whose text file went missing becomes a placeholder; replies still work', async () => {
+  const { store, ai } = mods;
+  const meta = await upload('gone.txt', 'text/plain', Buffer.from('soon to vanish '.repeat(5000)));
+  fs.rmSync(path.join(dataDir, 'uploads', meta.textFile));
+  store.addMessage({ role: 'user', text: 'did you read it?', attachments: [meta.id] });
+  const { raw } = await ai.generateReply({ onDelta: () => {} });
+  assert.ok(raw.length > 0);
+  assert.match(JSON.stringify(requests.at(-1).messages), /They sent a file: gone.txt/);
+});
+
+test('Claude gets at most 20 MB of PDFs as themselves in one request', async () => {
+  const { files, store } = mods;
+  const padded = (label) => {
+    const pdf = makePdf([`${label}: a short scanned form.`]).toString('latin1');
+    // ~9 MB of padding in an unused object, as a photo-heavy scan would be
+    return Buffer.from(pdf.replace('trailer', `99 0 obj<</Length 9000000>>stream\n${' '.repeat(9_000_000)}\nendstream endobj\ntrailer`), 'latin1');
+  };
+  const pdfs = [];
+  for (const label of ['A', 'B', 'C']) pdfs.push(await upload(`${label}.pdf`, 'application/pdf', padded(label)));
+  const msg = store.addMessage({ role: 'user', text: 'three forms', attachments: pdfs.map((p) => p.id) });
+  const turns = [{ role: 'user', content: [{ type: 'files', ids: pdfs.map((p) => p.id) }] }];
+  const f = await files.prepareFiles({ turns, messages: [msg], fresh: new Set(pdfs.map((p) => p.id)), query: '', budget: { inlineFresh: 100000, inlineOlder: 100000, excerpts: 20000, overview: 1500, maxParts: 30, stable: true }, claude: true });
+  assert.equal(f.native.size, 2);
+  assert.ok(!f.native.has(pdfs[0].id), 'the newest go as themselves');
+});
+
+test('a Word file with a huge styles part is read with the light reader, not mammoth', async () => {
+  const { default: JSZip } = await import('jszip');
+  const zip = new JSZip();
+  zip.file('[Content_Types].xml', '<Types/>');
+  zip.file('word/document.xml', '<w:document><w:body><w:p><w:r><w:t>Hello from a heavy Word file</w:t></w:r></w:p></w:body></w:document>');
+  zip.file('word/styles.xml', `<w:styles>${'<w:style w:styleId="x"><w:name w:val="x"/></w:style>'.repeat(600_000)}</w:styles>`);
+  const docx = await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
+  const t = Date.now();
+  const meta = await upload('heavy.docx', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', docx);
+  assert.equal(fs.readFileSync(path.join(dataDir, 'uploads', meta.textFile), 'utf8').trim(), 'Hello from a heavy Word file');
+  assert.ok(Date.now() - t < 3000, `took ${Date.now() - t} ms; mammoth takes several seconds here`);
+});
+
+test('a file still being read when the chat history is deleted is deleted too', async () => {
+  const { files } = mods;
+  const pending = upload('late.txt', 'text/plain', Buffer.from('a long letter '.repeat(20000)));
+  await files.deleteAllAttachments();
+  await assert.rejects(pending, /history was deleted/);
+  assert.deepEqual(fs.readdirSync(path.join(dataDir, 'uploads')), []);
 });

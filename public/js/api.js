@@ -47,9 +47,12 @@ export async function streamChat(items, handlers) {
 }
 
 // Uploads a file and reports how much has been sent (0 to 1). Big documents take a while, so the app shows it.
-export function uploadFile(form, onProgress) {
+// signal: an AbortSignal that cancels the upload (they removed the file).
+export function uploadFile(form, onProgress, signal) {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
+    signal?.addEventListener('abort', () => xhr.abort());
+    xhr.onabort = () => reject(Object.assign(new Error('Upload cancelled.'), { cancelled: true }));
     xhr.open('POST', '/api/upload');
     xhr.withCredentials = true;
     xhr.upload.onprogress = (e) => e.lengthComputable && onProgress?.(e.loaded / e.total);

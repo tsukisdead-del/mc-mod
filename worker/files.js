@@ -10,8 +10,13 @@ export const MAX_UPLOAD_MB = 20;
 const MAX_BYTES = MAX_UPLOAD_MB * 1024 * 1024;
 // A D1 row holds at most 2,000,000 bytes; base64 adds a third.
 const MAX_STORED_BYTES = 1_400_000;
-// About 1,200 pages. Storing a document takes Worker CPU time in proportion to its length.
-const MAX_DOC_CHARS = 3_000_000;
+// About 500 pages. Reading and storing a document takes Worker CPU time in proportion to its length, and the
+// free plan allows about 10 ms per request (with some leeway for the odd big one).
+export const MAX_DOC_CHARS = 1_200_000;
+// D1's free plan writes 100,000 rows a day; each part of a document takes about 3. Leave most for chatting.
+const DAILY_DOC_ROWS = 40_000;
+const DAY = 24 * 60 * 60 * 1000;
+export const DOC_ROWS_PREFIX = 'doc_rows:';
 
 async function documentText(env, name, blob) {
   if (env.MOCK_AI === '1') return `(Demo mode: pretend this is the text of ${name}.)`;
@@ -61,6 +66,12 @@ export async function handleUpload(request, env, store) {
           : await documentText(env, file.name, file.type === mime ? file : new Blob([file], { type: mime }));
       const text = checkText(raw, MAX_DOC_CHARS);
       doc = { text, parts: chunkText(text), tokens: Math.ceil(text.length / charsPerToken(text)) };
+      const rows = doc.parts.length * 3;
+      const key = `${DOC_ROWS_PREFIX}${new Date().toISOString().slice(0, 10)}`;
+      if ((await store.bump(key, DAY, rows)) > DAILY_DOC_ROWS) {
+        await store.bump(key, DAY, -rows);
+        throw new UploadError("You've sent a lot of long documents today, and the free database has a daily limit. Try this one again tomorrow.");
+      }
     }
     const base64 = keepOriginal ? Buffer.from(bytes).toString('base64') : null;
     const meta = await store.saveAttachment({ name: cleanName(file.name), kind, mime, size: file.size }, base64, doc);

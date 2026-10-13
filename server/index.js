@@ -7,11 +7,12 @@ import { config } from './config.js';
 import { state, save, flush, addMessage, publicMessage, newId, UPLOAD_DIR } from './store.js';
 import { requireAuth, login, logout, isAuthed } from './auth.js';
 import { applySettingsPatch, FREQUENCIES } from './settings.js';
-import { saveUpload, UploadError, attachmentPath, deleteAllAttachments } from './attachments.js';
+import { saveUpload, UploadError, attachmentPath, deleteAllAttachments, removeStrayFiles } from './attachments.js';
 import { generateReply, maybeUpdateMemory, friendlyMessage, providerInfo } from './ai.js';
 import { vapidPublicKey, addSubscription, removeSubscription, notifyAll, notifyMessage, deviceCount } from './push.js';
 import { startScheduler, reschedule, noteUserActivity, sendCheckinNow } from './scheduler.js';
 import { buildMobileConfig } from './profile.js';
+import { MAX_TEXT_CHARS } from './file-types.js';
 import { withLock } from './lock.js';
 import { parseReply, plainText } from '../public/js/reply-format.js';
 
@@ -146,6 +147,7 @@ api.get('/state', (req, res) => {
       // Local models work faster with smaller photos.
       photoMaxSide: config.aiProvider === 'ollama' ? 1024 : undefined,
       maxUploadMB: MAX_UPLOAD_MB,
+      maxDocChars: MAX_TEXT_CHARS,
       ...providerInfo(),
     },
   });
@@ -278,6 +280,8 @@ api.delete('/messages', async (req, res) => {
     await deleteAllAttachments();
     save();
   });
+  // Also forget photos and files the browser cached.
+  res.setHeader('Clear-Site-Data', '"cache"');
   res.json({ ok: true });
 });
 
@@ -386,8 +390,8 @@ async function checkOllama() {
   }
 }
 
-// Uploads cut off by a restart leave a temporary file behind.
-for (const f of fs.readdirSync(UPLOAD_DIR)) if (/^upload-.*\.tmp$/.test(f)) fs.rmSync(path.join(UPLOAD_DIR, f), { force: true });
+// Uploads cut off by a restart or crash leave files behind.
+removeStrayFiles();
 
 startScheduler();
 

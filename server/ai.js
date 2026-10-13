@@ -2,7 +2,7 @@ import Anthropic from '@anthropic-ai/sdk';
 import { config } from './config.js';
 import { state, save } from './store.js';
 import { PERSONA, settingsBlock, checkinInstruction, MEMORY_INSTRUCTIONS } from './prompts.js';
-import { attachmentPlaceholder, prepareFiles, claudeParts, localParts } from './attachments.js';
+import { attachmentPlaceholder, prepareFiles, claudeParts, localParts, excerptBlocks } from './attachments.js';
 import { buildTurns, resolveFiles, appendUserNote, transcript, nextHistoryStart, MEMORY_EVERY, RECENT_FILE_MESSAGES } from './history.js';
 import { DOC_BUDGETS, scaleBudget, searchTextFor } from './doc-search.js';
 import { looksLikeCrisis, CRISIS_NOTE } from './safety.js';
@@ -143,8 +143,13 @@ async function conversation({ claude, search }) {
   const budget = claude ? DOC_BUDGETS.claude : scaleBudget(DOC_BUDGETS.local, config.ollamaNumCtx / 16384);
   const files = await prepareFiles({ turns, messages, fresh, query: search ? searchTextFor(messages) : '', budget, claude });
   await resolveFiles(turns, (ids) => (claude ? claudeParts(ids, files) : localParts(ids, files, { vision: config.ollamaVision })));
-  // Matching parts go with their newest message, so earlier turns stay the same (and cached, for Claude).
-  if (files.excerpts.length && turns.at(-1)?.role === 'user') appendUserNote(turns, files.excerpts.join('\n\n'));
+  const last = turns.at(-1);
+  if (last?.role !== 'user') return turns;
+  // Claude: cache everything up to here, so the notes added after it (which change every turn) don't stop the
+  // next reply from reusing it.
+  if (claude && last.content.length) last.content.at(-1).cache_control = { type: 'ephemeral' };
+  // Matching parts go with their newest message, so earlier turns stay the same.
+  last.content.push(...excerptBlocks(files, claude));
   return turns;
 }
 
